@@ -1,7 +1,8 @@
+import collections
 import logging
 import os
 import time
-from typing import List
+from typing import Any, Dict, List
 
 import mss
 import numpy as np
@@ -18,6 +19,14 @@ from openrecall.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Shared state updated by the capture loop; read by Flask routes.
+capture_state: Dict[str, Any] = {
+    "last_capture_ts": 0,
+    "captures_this_session": 0,
+    "last_mssim": None,
+    "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
+}
 
 
 def _get_env_int(name: str, default: int, minimum: int) -> int:
@@ -218,10 +227,15 @@ def record_screenshots_thread() -> None:
 
 
         for i, current_screenshot in enumerate(current_screenshots):
+            t_frame_start = time.perf_counter()
             current_similarity_frame = _prepare_similarity_frame(current_screenshot)
             last_similarity_frame = last_similarity_frames[i]
 
-            if not is_similar(current_similarity_frame, last_similarity_frame):
+            mssim_val = mean_structured_similarity_index(current_similarity_frame, last_similarity_frame)
+            t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
+            capture_state["last_mssim"] = round(mssim_val, 4)
+
+            if mssim_val < 0.9:
                 last_similarity_frames[i] = current_similarity_frame
                 image = Image.fromarray(current_screenshot)
                 timestamp = int(time.time())
@@ -232,13 +246,38 @@ def record_screenshots_thread() -> None:
                     format="webp",
                     lossless=True,
                 )
+
+                t_ocr_start = time.perf_counter()
                 ocr_input = _resize_for_ocr(current_screenshot)
                 text: str = extract_text_from_image(ocr_input)
-                # Only proceed if OCR actually extracts text
+                t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
+
+                t_embed_ms = 0.0
+                t_db_ms = 0.0
                 if text.strip():
+                    t_embed_start = time.perf_counter()
                     embedding: np.ndarray = get_embedding(text)
+                    t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
+
                     active_app_name: str = get_active_app_name() or "Unknown App"
                     active_window_title: str = get_active_window_title() or "Unknown Title"
+
+                    t_db_start = time.perf_counter()
                     insert_entry(text, timestamp, embedding, active_app_name, active_window_title)
+                    t_db_ms = (time.perf_counter() - t_db_start) * 1000
+
+                total_ms = (time.perf_counter() - t_frame_start) * 1000
+                timing = {
+                    "timestamp": timestamp,
+                    "mssim_ms": round(t_mssim_ms, 1),
+                    "ocr_ms": round(t_ocr_ms, 1),
+                    "embedding_ms": round(t_embed_ms, 1),
+                    "db_ms": round(t_db_ms, 1),
+                    "total_ms": round(total_ms, 1),
+                    "had_text": bool(text.strip()),
+                }
+                capture_state["recent_timings"].append(timing)
+                capture_state["last_capture_ts"] = timestamp
+                capture_state["captures_this_session"] += 1
 
         time.sleep(CAPTURE_INTERVAL_SECONDS)
