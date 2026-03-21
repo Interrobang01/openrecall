@@ -39,7 +39,8 @@ def _get_model() -> Optional[SentenceTransformer]:
     if model is not None:
         return model
 
-    _model_device = _resolve_embedding_device()
+    requested_device = _resolve_embedding_device()
+    _model_device = requested_device
     try:
         model = SentenceTransformer(MODEL_NAME, device=_model_device)
         if _model_device == "cpu":
@@ -55,13 +56,37 @@ def _get_model() -> Optional[SentenceTransformer]:
                 _model_device,
             )
     except Exception as e:
-        logger.error(
-            "Failed to load SentenceTransformer model '%s' on '%s': %s",
-            MODEL_NAME,
-            _model_device,
-            e,
-        )
-        model = None
+        if requested_device != "cpu":
+            logger.warning(
+                "Failed to load SentenceTransformer model '%s' on '%s': %s. "
+                "Falling back to CPU.",
+                MODEL_NAME,
+                requested_device,
+                e,
+            )
+            _model_device = "cpu"
+            try:
+                model = SentenceTransformer(MODEL_NAME, device=_model_device)
+                logger.warning(
+                    "SentenceTransformer model '%s' is running on CPU. "
+                    "Set OPENRECALL_EMBEDDING_DEVICE to override.",
+                    MODEL_NAME,
+                )
+            except Exception as cpu_error:
+                logger.error(
+                    "Failed to load SentenceTransformer model '%s' on CPU after fallback: %s",
+                    MODEL_NAME,
+                    cpu_error,
+                )
+                model = None
+        else:
+            logger.error(
+                "Failed to load SentenceTransformer model '%s' on '%s': %s",
+                MODEL_NAME,
+                _model_device,
+                e,
+            )
+            model = None
     return model
 
 
