@@ -142,7 +142,7 @@ def record_screenshots_thread() -> None:
                 last_screenshots[i] = current_screenshot  # Update the last screenshot for this monitor
                 image = Image.fromarray(current_screenshot)
                 timestamp = int(time.time())
-                filename = f"{timestamp}_{i}.webp" # Add monitor index to filename for uniqueness
+                filename = f"{timestamp}.webp"
                 filepath = os.path.join(screenshots_path, filename)
                 image.save(
                     filepath,
@@ -155,51 +155,6 @@ def record_screenshots_thread() -> None:
                     embedding: np.ndarray = get_embedding(text)
                     active_app_name: str = get_active_app_name() or "Unknown App"
                     active_window_title: str = get_active_window_title() or "Unknown Title"
-                    insert_entry(
-                        text, timestamp, embedding, active_app_name, active_window_title, filename # Pass filename
-                    )
-
-        time.sleep(3) # Wait before taking the next screenshot
-
-    return screenshots
-
-
-def record_screenshots_thread():
-    # TODO: fix the error from huggingface tokenizers
-    import os
-
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    last_screenshots = take_screenshots()
-
-    while True:
-        if not is_user_active():
-            time.sleep(3)
-            continue
-
-        screenshots = take_screenshots()
-
-        for i, screenshot in enumerate(screenshots):
-
-            last_screenshot = last_screenshots[i]
-
-            if not is_similar(screenshot, last_screenshot):
-                last_screenshots[i] = screenshot
-                image = Image.fromarray(screenshot)
-                timestamp = int(time.time())
-                image.save(
-                    os.path.join(screenshots_path, f"{timestamp}.webp"),
-                    format="webp",
-                    lossless=True,
-                )
-                text: str = extract_text_from_image(current_screenshot)
-                # Only proceed if OCR actually extracts text
-                if text.strip():
-                    embedding: np.ndarray = get_embedding(text)
-                    active_app_name: str = get_active_app_name() or "Unknown App"
-                    active_window_title: str = get_active_window_title() or "Unknown Title"
-                    insert_entry(
-                        text, timestamp, embedding, active_app_name, active_window_title, filename # Pass filename
-                    )
+                    insert_entry(text, timestamp, embedding, active_app_name, active_window_title)
 
         time.sleep(3) # Wait before taking the next screenshot
