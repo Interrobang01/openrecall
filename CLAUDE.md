@@ -51,4 +51,10 @@ Follows `.tinycoder/rules/python_style_guide.md`:
 
 - Python 3.11 required (see `.python-version`)
 - Platform-specific dependencies: Windows needs `pywin32`/`psutil`, macOS needs `pyobjc`, Linux needs `xprop`/`xprintidle` system packages
-- OCR dependency (`python-doctr`) comes from a custom git fork specified in `setup.py`
+- OCR uses the official `python-doctr==1.0.1` PyPI package (PyTorch backend only, no TensorFlow)
+
+## Dependency Constraints
+
+- **`numpy` must stay `<2.0.0`** — `python-doctr` declares this upper bound; attempting `numpy>=2` causes a hard install conflict
+- **`transformers` must be `>=5.0.0`** — versions 4.57.x had a bug that unconditionally imported TensorFlow at startup (via the loss module chain), which crashed against the system's `tensorflow==2.9.3` + `protobuf==6.33.4`. Transformers 5.x fixed this.
+- **Do not revert `python-doctr` to the old `koenvaneijk` git fork** — that fork was frozen at June 2024, used the removed `huggingface_hub.Repository` API, and always imported TensorFlow on startup

@@ -8,16 +8,17 @@ with io.open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 install_requires = [
-    "Flask==3.0.3",
+    "Flask==3.1.3",
     "numpy==1.26.4",
-    "mss==9.0.1",
-    "sentence-transformers==3.0.0",
+    "mss==10.1.0",
+    "sentence-transformers==5.3.0",
+    "transformers==5.3.0",
     "torch==2.10.0",
     "torchvision==0.25.0",
-    "shapely==2.0.4",
-    "h5py==3.11.0",
-    "rapidfuzz==3.9.3",
-    "Pillow==10.3.0",
+    "shapely==2.1.2",
+    "h5py==3.16.0",
+    "rapidfuzz==3.14.3",
+    "Pillow==12.1.1",
 ]
 
 # Define OS-specific dependencies
@@ -26,7 +27,7 @@ extras_require = {
     "macos": ["pyobjc==10.3"],
     "linux": [],
     "python-doctr": [
-        "python-doctr @ git+https://github.com/koenvaneijk/doctr.git@af711bc04eb8876a7189923fb51ec44481ee18cd"
+        "python-doctr==1.0.1"
     ],
 }
 
