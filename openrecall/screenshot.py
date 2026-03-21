@@ -1,6 +1,7 @@
+import logging
 import os
 import time
-from typing import List, Tuple
+from typing import List
 
 import mss
 import numpy as np
@@ -16,34 +17,110 @@ from openrecall.utils import (
     is_user_active,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _get_env_int(name: str, default: int, minimum: int) -> int:
+    """Reads an integer env var with bounds and fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return max(minimum, int(raw_value))
+    except ValueError:
+        logger.warning("Invalid %s value '%s'. Falling back to %s.", name, raw_value, default)
+        return default
+
+
+def _get_env_float(name: str, default: float, minimum: float) -> float:
+    """Reads a float env var with bounds and fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return max(minimum, float(raw_value))
+    except ValueError:
+        logger.warning("Invalid %s value '%s'. Falling back to %.2f.", name, raw_value, default)
+        return default
+
+
+CAPTURE_INTERVAL_SECONDS: float = _get_env_float(
+    "OPENRECALL_CAPTURE_INTERVAL_SECONDS", default=3.0, minimum=1.0
+)
+SIMILARITY_FRAME_WIDTH: int = _get_env_int(
+    "OPENRECALL_SIMILARITY_FRAME_WIDTH", default=0, minimum=0
+)
+OCR_MAX_DIMENSION: int = _get_env_int(
+    "OPENRECALL_OCR_MAX_DIMENSION", default=0, minimum=0
+)
+
+
+def _resize_for_ocr(image: np.ndarray, max_dimension: int = OCR_MAX_DIMENSION) -> np.ndarray:
+    """Resizes the image for OCR if its longest side is larger than max_dimension."""
+    height, width = image.shape[:2]
+    longest_side = max(height, width)
+
+    if max_dimension <= 0:
+        return image
+
+    if longest_side <= max_dimension:
+        return image
+
+    scale = max_dimension / float(longest_side)
+    resized_width = max(1, int(width * scale))
+    resized_height = max(1, int(height * scale))
+    resized_image = Image.fromarray(image).resize(
+        (resized_width, resized_height),
+        Image.Resampling.BILINEAR,
+    )
+    return np.asarray(resized_image)
+
+
+def _prepare_similarity_frame(
+    image: np.ndarray, target_width: int = SIMILARITY_FRAME_WIDTH
+) -> np.ndarray:
+    """Builds a compact grayscale frame used for cheap similarity checks."""
+    height, width = image.shape[:2]
+    if target_width > 0 and width > target_width:
+        scale = target_width / float(width)
+        target_height = max(1, int(height * scale))
+        image = np.asarray(
+            Image.fromarray(image).resize(
+                (target_width, target_height),
+                Image.Resampling.BILINEAR,
+            )
+        )
+
+    return (
+        0.2989 * image[..., 0].astype(np.float32)
+        + 0.5870 * image[..., 1].astype(np.float32)
+        + 0.1140 * image[..., 2].astype(np.float32)
+    )
+
 
 def mean_structured_similarity_index(
     img1: np.ndarray, img2: np.ndarray, L: int = 255
 ) -> float:
-    """Calculates the Mean Structural Similarity Index (MSSIM) between two images.
+    """Calculates the Mean Structural Similarity Index (MSSIM) between two frames.
 
     Args:
-        img1: The first image as a NumPy array (RGB).
-        img2: The second image as a NumPy array (RGB).
+        img1: The first frame as a NumPy array.
+        img2: The second frame as a NumPy array.
         L: The dynamic range of the pixel values (default is 255).
 
     Returns:
-        The MSSIM value between the two images (float between -1 and 1).
+        The MSSIM value between the two frames (float between -1 and 1).
     """
     K1, K2 = 0.01, 0.03
     C1, C2 = (K1 * L) ** 2, (K2 * L) ** 2
 
-    def rgb2gray(img: np.ndarray) -> np.ndarray:
-        """Converts an RGB image to grayscale."""
-        return 0.2989 * img[..., 0] + 0.5870 * img[..., 1] + 0.1140 * img[..., 2]
-
-    img1_gray: np.ndarray = rgb2gray(img1)
-    img2_gray: np.ndarray = rgb2gray(img2)
-    mu1: float = np.mean(img1_gray)
-    mu2: float = np.mean(img2_gray)
-    sigma1_sq = np.var(img1_gray)
-    sigma2_sq = np.var(img2_gray)
-    sigma12 = np.mean((img1_gray - mu1) * (img2_gray - mu2))
+    mu1: float = np.mean(img1)
+    mu2: float = np.mean(img2)
+    sigma1_sq = np.var(img1)
+    sigma2_sq = np.var(img2)
+    sigma12 = np.mean((img1 - mu1) * (img2 - mu2))
     ssim_index = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / (
         (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
     )
@@ -53,11 +130,11 @@ def mean_structured_similarity_index(
 def is_similar(
     img1: np.ndarray, img2: np.ndarray, similarity_threshold: float = 0.9
 ) -> bool:
-    """Checks if two images are similar based on MSSIM.
+    """Checks if two preprocessed frames are similar based on MSSIM.
 
     Args:
-        img1: The first image as a NumPy array.
-        img2: The second image as a NumPy array.
+        img1: The first frame as a NumPy array.
+        img2: The second frame as a NumPy array.
         similarity_threshold: The threshold above which images are considered similar.
 
     Returns:
@@ -117,29 +194,35 @@ def record_screenshots_thread() -> None:
     # when used in environments where multiprocessing fork safety is a concern.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    last_screenshots: List[np.ndarray] = take_screenshots()
+    last_similarity_frames: List[np.ndarray] = [
+        _prepare_similarity_frame(screenshot) for screenshot in take_screenshots()
+    ]
 
     while True:
         if not is_user_active():
-            time.sleep(3)  # Wait longer if user is inactive
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
             continue
 
         current_screenshots: List[np.ndarray] = take_screenshots()
 
-        # Ensure we have a last_screenshot for each current_screenshot
+        # Ensure we have a last frame for each current screenshot.
         # This handles cases where monitor setup might change (though unlikely mid-run)
-        if len(last_screenshots) != len(current_screenshots):
-             # If monitor count changes, reset last_screenshots and continue
-             last_screenshots = current_screenshots
-             time.sleep(3)
-             continue
+        if len(last_similarity_frames) != len(current_screenshots):
+            # If monitor count changes, reset and continue.
+            last_similarity_frames = [
+                _prepare_similarity_frame(screenshot)
+                for screenshot in current_screenshots
+            ]
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
+            continue
 
 
         for i, current_screenshot in enumerate(current_screenshots):
-            last_screenshot = last_screenshots[i]
+            current_similarity_frame = _prepare_similarity_frame(current_screenshot)
+            last_similarity_frame = last_similarity_frames[i]
 
-            if not is_similar(current_screenshot, last_screenshot):
-                last_screenshots[i] = current_screenshot  # Update the last screenshot for this monitor
+            if not is_similar(current_similarity_frame, last_similarity_frame):
+                last_similarity_frames[i] = current_similarity_frame
                 image = Image.fromarray(current_screenshot)
                 timestamp = int(time.time())
                 filename = f"{timestamp}.webp"
@@ -149,7 +232,8 @@ def record_screenshots_thread() -> None:
                     format="webp",
                     lossless=True,
                 )
-                text: str = extract_text_from_image(current_screenshot)
+                ocr_input = _resize_for_ocr(current_screenshot)
+                text: str = extract_text_from_image(ocr_input)
                 # Only proceed if OCR actually extracts text
                 if text.strip():
                     embedding: np.ndarray = get_embedding(text)
@@ -157,4 +241,4 @@ def record_screenshots_thread() -> None:
                     active_window_title: str = get_active_window_title() or "Unknown Title"
                     insert_entry(text, timestamp, embedding, active_app_name, active_window_title)
 
-        time.sleep(3) # Wait before taking the next screenshot
+        time.sleep(CAPTURE_INTERVAL_SECONDS)

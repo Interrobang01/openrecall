@@ -1,10 +1,10 @@
 ```
-   ____                   ____                  ____   
-  / __ \____  ___  ____  / __ \___  _________ _/ / /   
- / / / / __ \/ _ \/ __ \/ /_/ / _ \/ ___/ __ `/ / /    
-/ /_/ / /_/ /  __/ / / / _, _/  __/ /__/ /_/ / / /     
-\____/ .___/\___/_/ /_/_/ |_|\___/\___/\__,_/_/_/      
-    /_/                                                                                                                         
+   ____                   ____                  ____
+  / __ \____  ___  ____  / __ \___  _________ _/ / /
+ / / / / __ \/ _ \/ __ \/ /_/ / _ \/ ___/ __ `/ / /
+/ /_/ / /_/ /  __/ / / / _, _/  __/ /__/ /_/ / / /
+\____/ .___/\___/_/ /_/_/ |_|\___/\___/\__,_/_/_/
+    /_/
 ```
 **Enjoy this project?** Show your support by starring it! ⭐️ Thank you!
 
@@ -26,7 +26,7 @@ OpenRecall offers several key advantages over closed-source alternatives:
 
 - **Transparency**: OpenRecall is 100% open-source, allowing you to audit the source code for potential backdoors or privacy-invading features.
 - **Cross-platform Support**: OpenRecall works on Windows, macOS, and Linux, giving you the freedom to use it on your preferred operating system.
-- **Privacy-focused**: Your data is stored locally on your device, no internet connection or cloud is required. In addition, you have the option to encrypt the data on a removable disk for added security, read how in our [guide](docs/encryption.md) here. 
+- **Privacy-focused**: Your data is stored locally on your device, no internet connection or cloud is required. In addition, you have the option to encrypt the data on a removable disk for added security, read how in our [guide](docs/encryption.md) here.
 - **Hardware Compatibility**: OpenRecall is designed to work with a [wide range of hardware](docs/hardware.md), unlike proprietary solutions that may require specific certified devices.
 
 <p align="center">
@@ -86,6 +86,34 @@ Open your browser to:
 `--storage-path` (default: user data path for your OS): allows you to specify the path where the screenshots and database should be stored. We recommend [creating an encrypted volume](docs/encryption.md) to store your data.
 
 `--primary-monitor-only` (default: False): only record the primary monitor (rather than individual screenshots for other monitors)
+
+## Performance & GPU notes
+
+OpenRecall runs OCR + embeddings through PyTorch. GPU acceleration is available only when your PyTorch build supports your GPU backend.
+
+- NVIDIA: CUDA build of PyTorch
+- Apple Silicon: MPS backend
+- AMD on Linux: ROCm-compatible GPU **and** a ROCm-enabled PyTorch build (where `torch.version.hip` is set)
+
+If `torch.cuda.is_available()` is false and `torch.version.hip` is `None`, OpenRecall runs on CPU.
+
+You can tune performance with environment variables:
+
+- `OPENRECALL_CAPTURE_INTERVAL_SECONDS` (default `3.0`, min `1.0`)
+- `OPENRECALL_SIMILARITY_FRAME_WIDTH` (default `0` = disabled/original full-size behavior; min `0`)
+- `OPENRECALL_OCR_MAX_DIMENSION` (default `0` = disabled/original full-size behavior; min `0`)
+- `OPENRECALL_EMBEDDING_DEVICE` (override embedding device, e.g. `cpu`)
+- `OPENRECALL_OCR_DEVICE` (override OCR device, e.g. `cpu`)
+
+Examples:
+
+```bash
+# Lower CPU usage (less frequent capture + smaller OCR input)
+OPENRECALL_CAPTURE_INTERVAL_SECONDS=5 OPENRECALL_OCR_MAX_DIMENSION=960 python3 -m openrecall.app
+
+# Force CPU explicitly
+OPENRECALL_EMBEDDING_DEVICE=cpu OPENRECALL_OCR_DEVICE=cpu python3 -m openrecall.app
+```
 
 ## Uninstall instructions
 

@@ -1,22 +1,75 @@
-import numpy as np
-from sentence_transformers import SentenceTransformer
 import logging
+import os
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+
 logger = logging.getLogger(__name__)
 
 # Constants
 MODEL_NAME: str = "all-MiniLM-L6-v2"
 EMBEDDING_DIM: int = 384  # Dimension for all-MiniLM-L6-v2
 
-# Load the model globally to avoid reloading it on every call
-try:
-    model = SentenceTransformer(MODEL_NAME)
-    logger.info(f"SentenceTransformer model '{MODEL_NAME}' loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load SentenceTransformer model '{MODEL_NAME}': {e}")
-    model = None
+model: Optional[SentenceTransformer] = None
+_model_device: str = "cpu"
+
+
+def _resolve_embedding_device() -> str:
+    """Resolves which device should be used for embedding inference."""
+    forced_device = os.getenv("OPENRECALL_EMBEDDING_DEVICE")
+    if forced_device:
+        return forced_device
+
+    if torch.cuda.is_available():
+        return "cuda"
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+
+    return "cpu"
+
+
+def _get_model() -> Optional[SentenceTransformer]:
+    """Lazily initializes and returns the embedding model."""
+    global model
+    global _model_device
+
+    if model is not None:
+        return model
+
+    _model_device = _resolve_embedding_device()
+    try:
+        model = SentenceTransformer(MODEL_NAME, device=_model_device)
+        if _model_device == "cpu":
+            logger.warning(
+                "SentenceTransformer model '%s' is running on CPU. "
+                "Set OPENRECALL_EMBEDDING_DEVICE to override.",
+                MODEL_NAME,
+            )
+        else:
+            logger.info(
+                "SentenceTransformer model '%s' loaded on device '%s'.",
+                MODEL_NAME,
+                _model_device,
+            )
+    except Exception as e:
+        logger.error(
+            "Failed to load SentenceTransformer model '%s' on '%s': %s",
+            MODEL_NAME,
+            _model_device,
+            e,
+        )
+        model = None
+    return model
+
+
+def get_embedding_runtime_device() -> str:
+    """Returns the runtime device used by the embedding model."""
+    if model is None:
+        _get_model()
+    return _model_device
 
 
 def get_embedding(text: str) -> np.ndarray:
@@ -35,25 +88,34 @@ def get_embedding(text: str) -> np.ndarray:
         or a zero vector if the input is empty, whitespace only, or the
         model failed to load. The array type is float32.
     """
-    if model is None:
+    embedding_model = _get_model()
+    if embedding_model is None:
         logger.error("SentenceTransformer model is not loaded. Returning zero vector.")
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
     if not text or text.isspace():
-        logger.warning("Input text is empty or whitespace. Returning zero vector.")
+        logger.debug("Input text is empty or whitespace. Returning zero vector.")
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
     # Split text into non-empty lines
     sentences = [line for line in text.split("\n") if line.strip()]
 
     if not sentences:
-        logger.warning("No non-empty lines found after splitting. Returning zero vector.")
+        logger.debug("No non-empty lines found after splitting. Returning zero vector.")
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
     try:
-        sentence_embeddings = model.encode(sentences)
+        with torch.inference_mode():
+            sentence_embeddings = embedding_model.encode(
+                sentences,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=min(16, len(sentences)),
+            )
         # Calculate the mean embedding
-        mean_embedding = np.mean(sentence_embeddings, axis=0, dtype=np.float32)
+        mean_embedding = np.mean(
+            np.asarray(sentence_embeddings, dtype=np.float32), axis=0, dtype=np.float32
+        )
         return mean_embedding
     except Exception as e:
         logger.error(f"Error generating embedding: {e}")
