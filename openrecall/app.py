@@ -320,6 +320,9 @@ def search():
 {% extends "base_template" %}
 {% block content %}
 <div class="container mt-3">
+  <div class="mb-3">
+    <a href="/" class="btn btn-sm btn-outline-secondary"><i class="bi bi-house"></i> Timeline</a>
+  </div>
   {% if not results %}
     <div class="alert alert-info">No results.</div>
   {% else %}
@@ -344,7 +347,7 @@ def search():
           </div>
           {% endif %}
           {% if r.text %}
-          <div class="ocr-snippet mt-1">{{ r.text }}</div>
+          <div class="mt-1" style="max-height:6rem; overflow-y:auto; font-size:0.72rem; color:#6c757d; white-space:pre-wrap; border-top:1px solid #eee; padding-top:4px;">{{ r.text }}</div>
           {% endif %}
         </div>
       </div>
