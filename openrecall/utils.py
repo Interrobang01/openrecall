@@ -1,6 +1,8 @@
 import sys
 import datetime
 import re
+import shutil
+from typing import Optional
 
 # Platform-specific imports with error handling
 try:
@@ -34,6 +36,22 @@ try:
     import subprocess
 except ImportError:
     subprocess = None  # Should always be available in standard lib
+
+
+_XPRINTIDLE_AVAILABLE: Optional[bool] = None
+_XPRINTIDLE_MISSING_WARNING_SHOWN: bool = False
+
+
+def _warn_xprintidle_missing_once() -> None:
+    """Prints a warning once when xprintidle is unavailable on Linux."""
+    global _XPRINTIDLE_MISSING_WARNING_SHOWN
+    if _XPRINTIDLE_MISSING_WARNING_SHOWN:
+        return
+    print(
+        "Warning: 'xprintidle' command not found. "
+        "Please install xprintidle to check user activity."
+    )
+    _XPRINTIDLE_MISSING_WARNING_SHOWN = True
 
 
 def human_readable_time(timestamp: int) -> str:
@@ -288,7 +306,7 @@ def get_active_window_title_linux() -> str:
     except Exception as e:
         print(f"Error getting Linux window title: {e}")
         return ""
-    
+
 def get_active_app_name() -> str:
     """Gets the active application name for the current platform.
 
@@ -410,18 +428,29 @@ def is_user_active_linux() -> bool:
         True if the user is considered active (idle < 5s), False otherwise.
         Returns True if the check fails or 'xprintidle' is not available.
     """
+    global _XPRINTIDLE_AVAILABLE
+
     if subprocess is None:
         print("Warning: 'subprocess' module not available for Linux idle check.")
-        return True # Assume active if module missing
+        return True  # Assume active if module missing
+
+    if _XPRINTIDLE_AVAILABLE is None:
+        _XPRINTIDLE_AVAILABLE = shutil.which("xprintidle") is not None
+
+    if not _XPRINTIDLE_AVAILABLE:
+        _warn_xprintidle_missing_once()
+        return True
+
     try:
         # Run xprintidle to get idle time in milliseconds
-        output = subprocess.check_output(['xprintidle'], timeout=1).decode()
+        output = subprocess.check_output(["xprintidle"], timeout=1).decode()
         idle_milliseconds = int(output.strip())
         idle_seconds = idle_milliseconds / 1000.0
         return idle_seconds < 5.0
     except FileNotFoundError:
-        print("Warning: 'xprintidle' command not found. Please install xprintidle to check user activity.")
-        return True # Assume active if command missing
+        _XPRINTIDLE_AVAILABLE = False
+        _warn_xprintidle_missing_once()
+        return True  # Assume active if command missing
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"Warning: Could not check Linux idle time ({e}), assuming user is active.")
         return True
@@ -430,7 +459,7 @@ def is_user_active_linux() -> bool:
         return True
     except Exception as e:
         print(f"An error occurred during Linux idle check: {e}")
-        return True # Assume active on other errors
+        return True  # Assume active on other errors
 
 
 def is_user_active() -> bool:

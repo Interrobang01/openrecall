@@ -68,7 +68,7 @@ base_template = """
   <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.3/dist/umd/popper.min.js"></script>
   <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
-  
+
 </body>
 </html>
 """
@@ -135,12 +135,12 @@ def timeline():
 
 @app.route("/search")
 def search():
-    q = request.args.get("q")
+    q = (request.args.get("q") or "").strip()
     entries = get_all_entries()
-    embeddings = [np.frombuffer(entry.embedding, dtype=np.float64) for entry in entries]
+    embeddings = [np.asarray(entry.embedding, dtype=np.float32) for entry in entries]
     query_embedding = get_embedding(q)
     similarities = [cosine_similarity(query_embedding, emb) for emb in embeddings]
-    indices = np.argsort(similarities)[::-1]
+    indices = np.argsort(similarities)[::-1] if similarities else []
     sorted_entries = [entries[i] for i in indices]
 
     return render_template_string(
