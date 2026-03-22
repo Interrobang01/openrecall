@@ -1,7 +1,11 @@
 import io
 import unittest
+from unittest import mock
+
+import numpy as np
 
 from openrecall.screenshot import MonitorAv1SegmentWriter
+import openrecall.screenshot as screenshot
 
 
 class DummyStdin:
@@ -54,6 +58,68 @@ class TestMonitorAv1SegmentWriterClose(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "ffmpeg AV1 writer exited"):
             writer.close()
+
+
+class DummyWriterStdin:
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        self.buffer.extend(data)
+        return len(data)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class DummyWriterProcess:
+    def __init__(self) -> None:
+        self.stdin = DummyWriterStdin()
+        self.stderr = io.BytesIO(b"")
+        self.returncode = 0
+
+    def communicate(self, timeout: int = 0):
+        return b"", b""
+
+
+class TestMonitorAv1SegmentWriterRotation(unittest.TestCase):
+    def test_rotates_by_frame_count(self):
+        writer = MonitorAv1SegmentWriter(monitor_id=1)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with mock.patch.object(screenshot, "AV1_SEGMENT_FRAMES", 2), mock.patch.object(
+            screenshot, "OPENRECALL_AV1_PLAYBACK_FPS", 2.0
+        ), mock.patch.object(
+            screenshot.subprocess,
+            "Popen",
+            side_effect=[DummyWriterProcess(), DummyWriterProcess()],
+        ):
+            segment_1, _ = writer.write_frame(frame, timestamp_ms=1000)
+            segment_2, _ = writer.write_frame(frame, timestamp_ms=2000)
+            segment_3, _ = writer.write_frame(frame, timestamp_ms=3000)
+
+        self.assertEqual(segment_1, segment_2)
+        self.assertNotEqual(segment_2, segment_3)
+
+    def test_segment_pts_ms_uses_playback_fps(self):
+        writer = MonitorAv1SegmentWriter(monitor_id=2)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with mock.patch.object(screenshot, "AV1_SEGMENT_FRAMES", 10), mock.patch.object(
+            screenshot, "OPENRECALL_AV1_PLAYBACK_FPS", 2.0
+        ), mock.patch.object(
+            screenshot.subprocess,
+            "Popen",
+            return_value=DummyWriterProcess(),
+        ):
+            _, pts_0 = writer.write_frame(frame, timestamp_ms=1000)
+            _, pts_1 = writer.write_frame(frame, timestamp_ms=2000)
+            _, pts_2 = writer.write_frame(frame, timestamp_ms=3000)
+
+        self.assertEqual(pts_0, 0)
+        self.assertEqual(pts_1, 500)
+        self.assertEqual(pts_2, 1000)
 
 
 if __name__ == "__main__":

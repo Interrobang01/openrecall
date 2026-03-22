@@ -99,7 +99,7 @@ If `torch.cuda.is_available()` is false and `torch.version.hip` is `None`, OpenR
 
 You can tune performance with environment variables:
 
-- `OPENRECALL_CAPTURE_INTERVAL_SECONDS` (default `3.0`, min `1.0`)
+- `OPENRECALL_CAPTURE_INTERVAL_SECONDS` (default `60.0`, min `1.0`)
 - `OPENRECALL_SIMILARITY_FRAME_WIDTH` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_OCR_MAX_DIMENSION` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_VERBOSE_CAPTURE_LOGS` (default `false`; set to `1`/`true` to enable stage/timing CLI prints)
@@ -115,7 +115,9 @@ You can tune performance with environment variables:
 - `OPENRECALL_FFMPEG_BIN` (default `ffmpeg`)
 - `OPENRECALL_AV1_CRF` (default `38`, lower = larger files / higher quality)
 - `OPENRECALL_AV1_PRESET` (default `8`, lower = slower encode / better compression)
-- `OPENRECALL_AV1_SEGMENT_SECONDS` (default `120`, min `1.0`)
+- `OPENRECALL_AV1_PLAYBACK_FPS` (default `2.0`, min `0.1`; encoded segment framerate used by video players)
+- `OPENRECALL_AV1_SEGMENT_FRAMES` (default `30`; min `1`; rotates segments by frame count)
+- `OPENRECALL_AV1_SEGMENT_SECONDS` (legacy/default-derivation knob; default `120`, min `1.0`)
 - `OPENRECALL_THUMB_QUALITY` (default `8`, range `1..100`)
 - `OPENRECALL_THUMB_MAX_DIMENSION` (default `320`, range `64..4096`)
 

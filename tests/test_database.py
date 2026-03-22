@@ -19,7 +19,9 @@ temp_db_file.close()
 with patch("openrecall.config.db_path", mock_db_path):
     from openrecall.database import (
         create_db,
+        delete_entries_by_segment_filenames,
         get_all_entries,
+        get_media_entries_for_segments,
         get_segment_frame_index,
         get_timeline_entries,
         get_timestamps,
@@ -279,6 +281,66 @@ class TestDatabase(unittest.TestCase):
                 "b",
                 segment_filename="x.mkv",
             )
+
+    def test_get_media_entries_for_segments(self):
+        embedding = np.array([0.1, 0.2], dtype=np.float32)
+        ts = int(time.time())
+
+        insert_entry(
+            "A",
+            ts,
+            embedding,
+            "App",
+            "Title",
+            segment_filename="seg_a.mkv",
+            segment_pts_ms=0,
+            thumb_filename="a.webp",
+        )
+        insert_entry(
+            "B",
+            ts + 1,
+            embedding,
+            "App",
+            "Title",
+            segment_filename="seg_b.mkv",
+            segment_pts_ms=500,
+            thumb_filename="b.webp",
+        )
+
+        media_entries = get_media_entries_for_segments(["seg_b.mkv"])
+        self.assertEqual(media_entries, [("seg_b.mkv", "b.webp")])
+
+    def test_delete_entries_by_segment_filenames(self):
+        embedding = np.array([0.1, 0.2], dtype=np.float32)
+        ts = int(time.time())
+
+        insert_entry(
+            "A",
+            ts,
+            embedding,
+            "App",
+            "Title",
+            segment_filename="seg_delete.mkv",
+            segment_pts_ms=0,
+            thumb_filename="delete_a.webp",
+        )
+        insert_entry(
+            "B",
+            ts + 1,
+            embedding,
+            "App",
+            "Title",
+            segment_filename="seg_keep.mkv",
+            segment_pts_ms=500,
+            thumb_filename="keep_b.webp",
+        )
+
+        deleted = delete_entries_by_segment_filenames(["seg_delete.mkv"])
+        self.assertEqual(deleted, 1)
+
+        entries = get_all_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].segment_filename, "seg_keep.mkv")
 
 
 class TestFfmpegHooks(unittest.TestCase):

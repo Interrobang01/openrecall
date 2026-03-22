@@ -1,31 +1,47 @@
 import glob
 import os
+import shutil
 import subprocess
 import sys
 from threading import Thread
+from typing import Dict, List, Tuple
 
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from jinja2 import BaseLoader
 
 from openrecall.config import (
-  OPENRECALL_FFMPEG_BIN,
+    OPENRECALL_FFMPEG_BIN,
     OPENRECALL_STORAGE_BACKEND,
+    RUNTIME_CONFIG_KEYS,
+  args,
     appdata_folder,
     check_ffmpeg_av1_capabilities,
+    config_file_path,
+    get_runtime_config_values,
     media_path,
     segments_path,
     thumbnails_path,
+    write_runtime_config_file,
 )
 from openrecall.database import (
     create_db,
+    delete_entries_by_segment_filenames,
     get_all_entries,
+    get_media_entries_for_segments,
   get_segment_frame_index,
     get_timestamps,
     get_timeline_entries,
 )
 from openrecall.nlp import cosine_similarity, get_embedding
-from openrecall.screenshot import capture_state, record_screenshots_thread
+from openrecall.screenshot import (
+  capture_state,
+  clear_capture_pause,
+  is_capture_paused,
+  record_screenshots_thread,
+  request_capture_stop,
+  set_capture_pause_for_seconds,
+)
 from openrecall.utils import human_readable_time, timestamp_to_human_readable
 
 app = Flask(__name__)
@@ -36,6 +52,17 @@ app.jinja_env.globals["storage_media_path"] = media_path
 
 frame_cache_path = os.path.join(media_path, "frame_cache")
 os.makedirs(frame_cache_path, exist_ok=True)
+quarantine_segments_path = os.path.join(media_path, "quarantine_segments")
+
+STARTUP_SEGMENT_RECOVERY_LIMIT = 8
+startup_recovery_state: Dict[str, object] = {
+  "ran": False,
+  "checked_segments": 0,
+  "quarantined_segments": [],
+  "entries_removed": 0,
+  "thumbs_removed": 0,
+  "cache_removed": 0,
+}
 
 
 def _json_safe(value):
@@ -117,6 +144,14 @@ base_template = """
     <span id="capture-dot" title="Last capture time"></span>
     <span id="capture-info" class="text-muted mr-2" style="font-size:0.78rem; white-space:nowrap;">idle</span>
 
+    <div class="btn-group btn-group-sm mr-2" role="group" aria-label="Capture controls">
+      <button class="btn btn-outline-secondary" id="pause-5m-btn" title="Pause capture for 5 minutes">Pause 5m</button>
+      <button class="btn btn-outline-secondary" id="pause-30m-btn" title="Pause capture for 30 minutes">Pause 30m</button>
+      <button class="btn btn-outline-secondary" id="resume-btn" title="Resume capture">Resume</button>
+    </div>
+
+    <span id="capture-action-feedback" class="text-muted mr-2" style="font-size:0.74rem; white-space:nowrap;"></span>
+
     <!-- Search bar -->
     <form class="form-inline flex-grow-1 d-flex" action="/search" method="get" style="min-width:200px;">
       <input class="form-control flex-grow-1 mr-1" type="search" name="q" placeholder="Search" aria-label="Search"
@@ -126,6 +161,14 @@ base_template = """
 
     <!-- Storage stats -->
     <span id="storage-badge" class="badge badge-light border text-muted" style="font-size:0.75rem; white-space:nowrap;" title="Storage usage"></span>
+
+    {% if request.path != '/' %}
+    <a href="/" class="btn btn-sm btn-outline-secondary" title="Go to timeline">
+      <i class="bi bi-house"></i> Timeline
+    </a>
+    {% endif %}
+
+    <span id="recovery-badge" class="badge badge-light border text-muted" style="font-size:0.75rem; white-space:nowrap;" title="Startup recovery status"></span>
 
     <!-- Open folder button -->
     <button class="btn btn-sm btn-outline-secondary" id="open-folder-btn"
@@ -137,6 +180,14 @@ base_template = """
     <a href="/metrics" class="btn btn-sm btn-outline-secondary" title="Performance metrics">
       <i class="bi bi-speedometer2"></i>
     </a>
+
+    <a href="/config" class="btn btn-sm btn-outline-secondary" title="Configuration">
+      <i class="bi bi-gear"></i>
+    </a>
+
+    <button class="btn btn-sm btn-outline-danger" id="hard-stop-btn" title="Stop OpenRecall process">
+      <i class="bi bi-power"></i> Stop
+    </button>
 
   </div>
 </nav>
@@ -154,16 +205,27 @@ function pollStatus() {
   fetch('/api/status').then(r => r.json()).then(data => {
     const dot = document.getElementById('capture-dot');
     const info = document.getElementById('capture-info');
+    const nowTs = Math.floor(Date.now() / 1000);
+    const pausedUntil = Number(data.paused_until_ts || 0);
+    const paused = !!data.is_paused;
+
     if (data.last_capture_ts && data.last_capture_ts !== lastCaptureTs) {
       lastCaptureTs = data.last_capture_ts;
       dot.classList.add('active');
       setTimeout(() => dot.classList.remove('active'), 800);
     }
-    if (data.last_capture_ts) {
+    if (paused) {
+      const left = Math.max(0, pausedUntil - nowTs);
+      info.textContent = 'paused ' + left + 's';
+      dot.title = 'Capture paused';
+      dot.classList.remove('active');
+    } else if (data.last_capture_ts) {
       const ago = Math.round((Date.now()/1000) - data.last_capture_ts);
       info.textContent = ago < 5 ? 'just now' : ago + 's ago';
       dot.title = 'Captures this session: ' + data.captures_this_session +
                   ' | MSSIM: ' + (data.last_mssim !== null ? data.last_mssim : '—');
+    } else {
+      info.textContent = 'idle';
     }
   }).catch(() => {});
 }
@@ -192,12 +254,115 @@ function loadStats() {
 }
 loadStats();
 
+// ---- Startup recovery status ----
+function loadRecoveryStatus() {
+  fetch('/api/recovery-status').then(r => r.json()).then(data => {
+    const badge = document.getElementById('recovery-badge');
+    if (!badge) {
+      return;
+    }
+
+    const quarantined = (data.quarantined_segments || []).length;
+    if (quarantined > 0) {
+      badge.classList.remove('badge-light');
+      badge.classList.add('badge-warning');
+      badge.textContent = 'Recovered ' + quarantined + ' seg';
+      badge.title = 'Startup recovery quarantined ' + quarantined + ' segment(s), removed ' +
+                    (data.entries_removed || 0) + ' DB entries';
+    } else {
+      badge.classList.remove('badge-warning');
+      badge.classList.add('badge-light');
+      badge.textContent = 'Recovery clean';
+      badge.title = 'Startup recovery found no unreadable recent segments';
+    }
+  }).catch(() => {});
+}
+loadRecoveryStatus();
+
 // ---- Open folder ----
 document.getElementById('open-folder-btn').addEventListener('click', function() {
   fetch('/open-folder', {method: 'POST'}).then(r => r.json()).then(d => {
     if (!d.ok) alert('Could not open folder: ' + d.error);
   }).catch(() => {});
 });
+
+function postJson(url, payload) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload || {})
+  }).then(r => r.json());
+}
+
+const captureActionFeedback = document.getElementById('capture-action-feedback');
+function setCaptureFeedback(message, timeoutMs) {
+  if (!captureActionFeedback) {
+    return;
+  }
+  captureActionFeedback.textContent = message;
+  if (timeoutMs && timeoutMs > 0) {
+    setTimeout(function() {
+      if (captureActionFeedback.textContent === message) {
+        captureActionFeedback.textContent = '';
+      }
+    }, timeoutMs);
+  }
+}
+
+const pause5mButton = document.getElementById('pause-5m-btn');
+if (pause5mButton) {
+  pause5mButton.addEventListener('click', function() {
+    postJson('/api/capture/pause', {minutes: 5}).then(() => {
+      setCaptureFeedback('Capture paused for 5 minutes.', 3500);
+      pollStatus();
+    }).catch(() => {
+      setCaptureFeedback('Failed to pause capture.', 4000);
+    });
+  });
+}
+
+const pause30mButton = document.getElementById('pause-30m-btn');
+if (pause30mButton) {
+  pause30mButton.addEventListener('click', function() {
+    postJson('/api/capture/pause', {minutes: 30}).then(() => {
+      setCaptureFeedback('Capture paused for 30 minutes.', 3500);
+      pollStatus();
+    }).catch(() => {
+      setCaptureFeedback('Failed to pause capture.', 4000);
+    });
+  });
+}
+
+const resumeButton = document.getElementById('resume-btn');
+if (resumeButton) {
+  resumeButton.addEventListener('click', function() {
+    postJson('/api/capture/resume', {}).then(() => {
+      setCaptureFeedback('Capture resumed.', 3000);
+      pollStatus();
+    }).catch(() => {
+      setCaptureFeedback('Failed to resume capture.', 4000);
+    });
+  });
+}
+
+const hardStopButton = document.getElementById('hard-stop-btn');
+if (hardStopButton) {
+  hardStopButton.addEventListener('click', function() {
+    const confirmed = window.confirm('Stop OpenRecall process now? This will close the app.');
+    if (!confirmed) {
+      return;
+    }
+
+    postJson('/api/hard-stop', {}).then(() => {
+      setCaptureFeedback('Stopping OpenRecall…', 2000);
+      setTimeout(function() {
+        location.reload();
+      }, 800);
+    }).catch(() => {
+      setCaptureFeedback('Failed to stop OpenRecall.', 4000);
+    });
+  });
+}
 </script>
 </body>
 </html>
@@ -212,6 +377,198 @@ class StringLoader(BaseLoader):
 
 
 app.jinja_env.loader = StringLoader()
+
+
+def _segment_recency_key(segment_filepath: str) -> int:
+  """Returns sortable recency key from segment filename, falling back to mtime."""
+  basename = os.path.basename(segment_filepath)
+  ts_token = basename.split("_", 1)[0]
+  try:
+    return int(ts_token)
+  except ValueError:
+    return int(os.path.getmtime(segment_filepath) * 1000)
+
+
+def _is_segment_decodable(segment_filepath: str) -> bool:
+  """Returns whether ffmpeg can decode the segment without errors."""
+  ffmpeg_command = [
+    OPENRECALL_FFMPEG_BIN,
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-v",
+    "error",
+    "-i",
+    segment_filepath,
+    "-map",
+    "0:v:0",
+    "-f",
+    "null",
+    "-",
+  ]
+  try:
+    result = subprocess.run(
+      ffmpeg_command,
+      check=False,
+      capture_output=True,
+      text=True,
+      timeout=45,
+    )
+    return result.returncode == 0
+  except (OSError, subprocess.TimeoutExpired):
+    return False
+
+
+def _recover_recent_corrupt_segments() -> None:
+  """Quarantines unreadable tail segments and removes related DB/media entries."""
+  startup_recovery_state["ran"] = True
+  startup_recovery_state["checked_segments"] = 0
+  startup_recovery_state["quarantined_segments"] = []
+  startup_recovery_state["entries_removed"] = 0
+  startup_recovery_state["thumbs_removed"] = 0
+  startup_recovery_state["cache_removed"] = 0
+
+  segment_filepaths = glob.glob(os.path.join(segments_path, "*.mkv"))
+  if not segment_filepaths:
+    return
+
+  recent_segment_paths = sorted(
+    segment_filepaths,
+    key=_segment_recency_key,
+    reverse=True,
+  )[:STARTUP_SEGMENT_RECOVERY_LIMIT]
+  startup_recovery_state["checked_segments"] = len(recent_segment_paths)
+
+  broken_segment_names: List[str] = []
+  for segment_filepath in recent_segment_paths:
+    if not _is_segment_decodable(segment_filepath):
+      broken_segment_names.append(os.path.basename(segment_filepath))
+
+  if not broken_segment_names:
+    return
+
+  os.makedirs(quarantine_segments_path, exist_ok=True)
+
+  media_entries = get_media_entries_for_segments(broken_segment_names)
+  thumbs_to_delete = {thumb for _, thumb in media_entries}
+
+  for segment_name in broken_segment_names:
+    source_path = os.path.join(segments_path, segment_name)
+    if not os.path.exists(source_path):
+      continue
+
+    destination_path = os.path.join(quarantine_segments_path, segment_name)
+    if os.path.exists(destination_path):
+      root, ext = os.path.splitext(segment_name)
+      destination_path = os.path.join(
+        quarantine_segments_path,
+        f"{root}.recovered{ext}",
+      )
+
+    try:
+      shutil.move(source_path, destination_path)
+    except OSError as exc:
+      print(
+        f"Startup recovery: failed to quarantine segment {segment_name}: {exc}",
+        file=sys.stderr,
+      )
+
+  deleted_entries = delete_entries_by_segment_filenames(broken_segment_names)
+
+  removed_thumbs = 0
+  for thumb_name in thumbs_to_delete:
+    thumb_path = os.path.join(thumbnails_path, thumb_name)
+    if os.path.exists(thumb_path):
+      try:
+        os.remove(thumb_path)
+        removed_thumbs += 1
+      except OSError:
+        pass
+
+  removed_cached_frames = 0
+  broken_prefixes = {os.path.splitext(name)[0] for name in broken_segment_names}
+  for cache_path in glob.glob(os.path.join(frame_cache_path, "*.png")):
+    cache_name = os.path.basename(cache_path)
+    if any(cache_name.startswith(prefix) for prefix in broken_prefixes):
+      try:
+        os.remove(cache_path)
+        removed_cached_frames += 1
+      except OSError:
+        pass
+
+  print(
+    "Startup recovery: quarantined unreadable segments "
+    f"count={len(broken_segment_names)} entries_removed={deleted_entries} "
+    f"thumbs_removed={removed_thumbs} cache_removed={removed_cached_frames}",
+    file=sys.stderr,
+  )
+
+  startup_recovery_state["quarantined_segments"] = sorted(broken_segment_names)
+  startup_recovery_state["entries_removed"] = int(deleted_entries)
+  startup_recovery_state["thumbs_removed"] = int(removed_thumbs)
+  startup_recovery_state["cache_removed"] = int(removed_cached_frames)
+
+
+def _parse_search_query(raw_query: str) -> Tuple[str, List[str]]:
+    """Parses query into semantic text and exact OCR phrases from quoted segments."""
+    exact_phrases: List[str] = []
+    semantic_parts: List[str] = []
+    buffer: List[str] = []
+    in_quotes = False
+    escape = False
+
+    for char in raw_query:
+      if escape:
+        buffer.append(char)
+        escape = False
+        continue
+
+      if char == "\\":
+        escape = True
+        continue
+
+      if char == '"':
+        chunk = "".join(buffer).strip()
+        if in_quotes:
+          if chunk:
+            exact_phrases.append(chunk)
+            semantic_parts.append(chunk)
+        else:
+          if chunk:
+            semantic_parts.append(chunk)
+        buffer = []
+        in_quotes = not in_quotes
+        continue
+
+      if not in_quotes and char.isspace():
+        chunk = "".join(buffer).strip()
+        if chunk:
+          semantic_parts.append(chunk)
+        buffer = []
+        continue
+
+      buffer.append(char)
+
+    if escape:
+      buffer.append("\\")
+
+    trailing_chunk = "".join(buffer).strip()
+    if trailing_chunk:
+      if in_quotes:
+        exact_phrases.append(trailing_chunk)
+      semantic_parts.append(trailing_chunk)
+
+    semantic_query = " ".join(semantic_parts).strip()
+    return semantic_query, exact_phrases
+
+
+def _entry_matches_exact_phrases(entry_text: str, exact_phrases: List[str]) -> bool:
+    """Checks whether entry OCR text contains all exact phrases (case-insensitive)."""
+    if not exact_phrases:
+      return True
+
+    haystack = (entry_text or "").lower()
+    return all(phrase.lower() in haystack for phrase in exact_phrases)
 
 
 @app.route("/")
@@ -257,18 +614,53 @@ def timeline():
     </div>
   </div>
 
-  <div class="slider-container">
+  <div class="slider-container mb-2">
     <input type="range" class="slider custom-range" id="discreteSlider" min="0" max="0" step="1" value="0">
-    <div class="slider-value" id="sliderValue"></div>
+    <div class="slider-value text-muted" id="sliderValue"></div>
+    <div class="small text-muted" id="monitorInfo"></div>
   </div>
-  <div class="image-container">
-    <img id="timestampImage" src="" alt="Screenshot" style="display:none;">
+
+  <div id="monitorPanels" class="row"></div>
+
+  <div class="modal fade" id="timelineModal" tabindex="-1" role="dialog" aria-hidden="true">
+    <div class="modal-dialog" role="document" style="max-width:min(1200px, 92vw); margin:2vh auto;">
+      <div class="modal-content">
+        <div class="modal-header py-2">
+          <div class="text-muted small" id="timelineModalLabel"></div>
+          <div class="ml-auto d-flex align-items-center" style="gap:6px;">
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="timelinePrevBtn" title="Previous timestamp (←)">
+              <i class="bi bi-arrow-left"></i>
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="timelineNextBtn" title="Next timestamp (→)">
+              <i class="bi bi-arrow-right"></i>
+            </button>
+          </div>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body p-0" style="background:#000;">
+          <img id="timelineModalImage" src="" alt="timeline screenshot"
+               style="max-height:80vh; max-width:100%; width:auto; height:auto; object-fit:contain; display:block; margin:0 auto;">
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
 <script>
 const allEntries = {{ timeline_entries|tojson }};  // descending order by timestamp, then monitor
-let filtered = allEntries.slice();
+let filteredEntries = allEntries.slice();
+let groupedByTimestamp = [];
+
+const monitorIds = Array.from(
+  new Set(allEntries.map(item => Number(item.monitor_id)))
+).sort((a, b) => a - b);
+
+const monitorColumnClass =
+  monitorIds.length <= 1
+    ? 'col-12 mb-3'
+    : monitorIds.length === 2
+      ? 'col-12 col-lg-6 mb-3'
+      : 'col-12 col-md-6 col-xl-4 mb-3';
 
 function toLocalDatetimeInput(ts) {
   const d = new Date(ts * 1000);
@@ -276,6 +668,19 @@ function toLocalDatetimeInput(ts) {
   const pad = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) +
          'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function groupEntriesByTimestamp(entries) {
+  const grouped = new Map();
+  entries.forEach(item => {
+    const key = String(item.timestamp);
+    if (!grouped.has(key)) {
+      grouped.set(key, { timestamp: item.timestamp, items: {} });
+    }
+    grouped.get(key).items[String(item.monitor_id)] = item;
+  });
+
+  return Array.from(grouped.values()).sort((a, b) => b.timestamp - a.timestamp);
 }
 
 // Set initial date inputs to span of data
@@ -286,12 +691,31 @@ dateTo.value   = toLocalDatetimeInput(allEntries[0].timestamp);
 
 const slider       = document.getElementById('discreteSlider');
 const sliderValue  = document.getElementById('sliderValue');
-const img          = document.getElementById('timestampImage');
 const rangeInfo    = document.getElementById('rangeInfo');
-let pendingFullFrameTimer = null;
-let latestFullFrameToken = 0;
-const fullFrameRetryCount = 2;
-const fullFrameRetryDelayMs = 220;
+const monitorInfo  = document.getElementById('monitorInfo');
+const monitorPanels = document.getElementById('monitorPanels');
+const modalElement = document.getElementById('timelineModal');
+const modalImage = document.getElementById('timelineModalImage');
+const modalLabel = document.getElementById('timelineModalLabel');
+
+let latestDisplayToken = 0;
+const fullFrameRetryCount = 8;
+const fullFrameRetryDelayMs = 280;
+const timelinePrevBtn = document.getElementById('timelinePrevBtn');
+const timelineNextBtn = document.getElementById('timelineNextBtn');
+
+function findLatestForMonitorAtOrBefore(monitorId, timestamp) {
+  for (let i = 0; i < groupedByTimestamp.length; i += 1) {
+    const candidate = groupedByTimestamp[i];
+    if (candidate.timestamp <= timestamp) {
+      const entry = candidate.items[String(monitorId)];
+      if (entry) {
+        return entry;
+      }
+    }
+  }
+  return null;
+}
 
 function buildFrameUrl(item) {
   return '/frame?segment=' + encodeURIComponent(item.segment_filename) +
@@ -302,65 +726,251 @@ function buildFrameUrl(item) {
 function applyFilter() {
   const from = dateFrom.value ? new Date(dateFrom.value).getTime() / 1000 : 0;
   const to   = dateTo.value   ? new Date(dateTo.value).getTime()   / 1000 : Infinity;
-  filtered = allEntries.filter(item => item.timestamp >= from && item.timestamp <= to);
-  slider.max = Math.max(0, filtered.length - 1);
+  filteredEntries = allEntries.filter(item => item.timestamp >= from && item.timestamp <= to);
+  groupedByTimestamp = groupEntriesByTimestamp(filteredEntries);
+
+  slider.max = Math.max(0, groupedByTimestamp.length - 1);
   slider.value = slider.max;
-  rangeInfo.textContent = filtered.length + ' of ' + allEntries.length + ' screenshots';
+  rangeInfo.textContent = groupedByTimestamp.length + ' timestamps · ' +
+                          filteredEntries.length + ' screenshots';
   updateDisplay();
 }
 
-function updateDisplay() {
-  if (filtered.length === 0) {
-    sliderValue.textContent = 'No screenshots in range';
-    img.style.display = 'none';
-    return;
-  }
-  // slider goes 0 (oldest) → max (newest); filtered is desc, so index = max - slider.value
-  const idx = filtered.length - 1 - parseInt(slider.value);
-  const item = filtered[idx];
-  sliderValue.textContent = new Date(item.timestamp * 1000).toLocaleString() + ' · monitor ' + item.monitor_id;
+function upgradeImageToFull(imageElement, item, expectedToken) {
+  const frameUrl = buildFrameUrl(item);
 
-  // Thumbnail first for fast scrubbing.
-  img.src = '/static/' + item.thumb_filename;
-  img.style.display = '';
-
-  // Then lazily upgrade to full frame extracted from AV1.
-  if (pendingFullFrameTimer) {
-    clearTimeout(pendingFullFrameTimer);
-  }
-  latestFullFrameToken += 1;
-  const frameToken = latestFullFrameToken;
-  pendingFullFrameTimer = setTimeout(function () {
-    const frameUrl = buildFrameUrl(item);
-
-    function tryLoadFullFrame(attempt) {
-      if (frameToken !== latestFullFrameToken) {
-        return;
-      }
-
-      const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
-      const fullFrame = new Image();
-      fullFrame.onload = function () {
-        if (frameToken === latestFullFrameToken) {
-          img.src = trialUrl;
-        }
-      };
-      fullFrame.onerror = function () {
-        if (frameToken !== latestFullFrameToken) {
-          return;
-        }
-        if (attempt < fullFrameRetryCount) {
-          setTimeout(function () {
-            tryLoadFullFrame(attempt + 1);
-          }, fullFrameRetryDelayMs);
-        }
-      };
-      fullFrame.src = trialUrl;
+  function tryLoadFullFrame(attempt) {
+    if (expectedToken !== latestDisplayToken) {
+      return;
     }
 
-    tryLoadFullFrame(0);
-  }, 120);
+    const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
+    const fullFrame = new Image();
+    fullFrame.onload = function () {
+      if (expectedToken === latestDisplayToken) {
+        imageElement.src = trialUrl;
+      }
+    };
+    fullFrame.onerror = function () {
+      if (attempt < fullFrameRetryCount) {
+        setTimeout(function () {
+          tryLoadFullFrame(attempt + 1);
+        }, fullFrameRetryDelayMs);
+      }
+    };
+    fullFrame.src = trialUrl;
+  }
+
+  tryLoadFullFrame(0);
 }
+
+function openTimelineModal(item) {
+  modalImage.src = '/static/' + item.thumb_filename;
+  modalImage.dataset.segment = item.segment_filename;
+  modalImage.dataset.ptsMs = String(item.segment_pts_ms || 0);
+  modalImage.dataset.thumb = item.thumb_filename;
+  modalImage.dataset.monitorId = String(item.monitor_id);
+  modalImage.dataset.timestamp = String(item.timestamp);
+  modalImage.dataset.fullLoaded = '0';
+  modalImage.dataset.fullLoading = '0';
+  modalLabel.textContent =
+    new Date(item.timestamp * 1000).toLocaleString() + ' · monitor ' + item.monitor_id;
+
+  setTimeout(function() {
+    upgradeTimelineModalImage();
+  }, 60);
+
+  if (window.jQuery) {
+    window.jQuery('#timelineModal').modal('show');
+  }
+}
+
+function upgradeTimelineModalImage() {
+  const image = document.getElementById('timelineModalImage');
+  if (!image || image.dataset.fullLoaded === '1' || image.dataset.fullLoading === '1') {
+    return;
+  }
+
+  image.dataset.fullLoading = '1';
+  const frameUrl = '/frame?segment=' + encodeURIComponent(image.dataset.segment || '') +
+    '&pts_ms=' + encodeURIComponent(image.dataset.ptsMs || '0') +
+    '&thumb=' + encodeURIComponent(image.dataset.thumb || '');
+
+  function tryLoadFullFrame(attempt) {
+    const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
+    const fullFrame = new Image();
+    fullFrame.onload = function () {
+      image.src = trialUrl;
+      image.dataset.fullLoaded = '1';
+      image.dataset.fullLoading = '0';
+    };
+    fullFrame.onerror = function () {
+      if (attempt < fullFrameRetryCount) {
+        setTimeout(function () {
+          tryLoadFullFrame(attempt + 1);
+        }, fullFrameRetryDelayMs);
+        return;
+      }
+      image.dataset.fullLoading = '0';
+    };
+    fullFrame.src = trialUrl;
+  }
+
+  tryLoadFullFrame(0);
+}
+
+function renderMonitorPanels(group) {
+  monitorPanels.innerHTML = '';
+
+  monitorIds.forEach(monitorId => {
+    const exactEntry = group.items[String(monitorId)] || null;
+    const entry = exactEntry || findLatestForMonitorAtOrBefore(monitorId, group.timestamp);
+    const isFallback = !exactEntry && !!entry;
+    const col = document.createElement('div');
+    col.className = monitorColumnClass;
+
+    const card = document.createElement('div');
+    card.className = 'card h-100 shadow-sm';
+
+    const header = document.createElement('div');
+    header.className = 'card-header py-1 px-2 d-flex justify-content-between align-items-center';
+    header.innerHTML = '<strong>Monitor ' + monitorId + '</strong>' +
+                       '<span class="small text-muted">' +
+                       (isFallback ? 'fallback' : (entry ? 'captured' : 'no frame')) +
+                       '</span>';
+    card.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'card-body p-2';
+
+    if (!entry) {
+      body.innerHTML = '<div class="text-muted small">No screenshot for this timestamp.</div>';
+    } else {
+      const trigger = document.createElement('a');
+      trigger.href = '#';
+      trigger.className = 'd-flex justify-content-center align-items-center';
+      trigger.style.background = '#000';
+      trigger.style.minHeight = '28vh';
+      trigger.style.maxHeight = '65vh';
+      trigger.style.borderRadius = '4px';
+
+      const image = document.createElement('img');
+      image.src = '/static/' + entry.thumb_filename;
+      image.alt = 'monitor screenshot';
+      image.style.maxHeight = '65vh';
+      image.style.maxWidth = '100%';
+      image.style.width = '100%';
+      image.style.height = '100%';
+      image.style.objectFit = 'contain';
+      image.style.display = 'block';
+      image.style.margin = '0 auto';
+      trigger.appendChild(image);
+
+      trigger.addEventListener('click', function(evt) {
+        evt.preventDefault();
+        openTimelineModal(entry);
+      });
+
+      body.appendChild(trigger);
+
+      if (isFallback) {
+        const fallbackMeta = document.createElement('div');
+        fallbackMeta.className = 'small text-muted mt-1';
+        fallbackMeta.textContent = 'Showing most recent frame: ' +
+          new Date(entry.timestamp * 1000).toLocaleString();
+        body.appendChild(fallbackMeta);
+      }
+
+      setTimeout(function() {
+        upgradeImageToFull(image, entry, latestDisplayToken);
+      }, 120);
+    }
+
+    card.appendChild(body);
+    col.appendChild(card);
+    monitorPanels.appendChild(col);
+  });
+}
+
+function updateDisplay() {
+  latestDisplayToken += 1;
+
+  if (groupedByTimestamp.length === 0) {
+    sliderValue.textContent = 'No screenshots in range';
+    monitorInfo.textContent = '';
+    monitorPanels.innerHTML = '';
+    return;
+  }
+
+  const idx = groupedByTimestamp.length - 1 - parseInt(slider.value);
+  const group = groupedByTimestamp[idx];
+  const capturedMonitors = Object.keys(group.items).length;
+  sliderValue.textContent = new Date(group.timestamp * 1000).toLocaleString();
+  monitorInfo.textContent = capturedMonitors + ' monitor(s) captured at this timestamp';
+  renderMonitorPanels(group);
+}
+
+function navigateTimelineModal(delta) {
+  if (!modalImage || !modalImage.dataset.timestamp || !modalImage.dataset.monitorId) {
+    return;
+  }
+
+  const currentTimestamp = Number(modalImage.dataset.timestamp);
+  const monitorId = Number(modalImage.dataset.monitorId);
+
+  const currentIndex = groupedByTimestamp.findIndex(function(item) {
+    return item.timestamp === currentTimestamp;
+  });
+  if (currentIndex < 0) {
+    return;
+  }
+
+  const nextIndex = currentIndex + delta;
+  if (nextIndex < 0 || nextIndex >= groupedByTimestamp.length) {
+    return;
+  }
+
+  const targetTimestamp = groupedByTimestamp[nextIndex].timestamp;
+  const nextEntry = findLatestForMonitorAtOrBefore(monitorId, targetTimestamp);
+  if (!nextEntry) {
+    return;
+  }
+
+  openTimelineModal(nextEntry);
+}
+
+if (window.jQuery) {
+  window.jQuery('#timelineModal').on('shown.bs.modal', function() {
+    upgradeTimelineModalImage();
+  });
+}
+
+if (timelinePrevBtn) {
+  timelinePrevBtn.addEventListener('click', function() {
+    navigateTimelineModal(1);
+  });
+}
+
+if (timelineNextBtn) {
+  timelineNextBtn.addEventListener('click', function() {
+    navigateTimelineModal(-1);
+  });
+}
+
+document.addEventListener('keydown', function(event) {
+  const modalShown = modalElement && modalElement.classList.contains('show');
+  if (!modalShown) {
+    return;
+  }
+
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    navigateTimelineModal(1);
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    navigateTimelineModal(-1);
+  }
+});
 
 slider.addEventListener('input', updateDisplay);
 dateFrom.addEventListener('change', applyFilter);
@@ -388,33 +998,61 @@ applyFilter();
 def search():
     q = (request.args.get("q") or "").strip()
     entries = get_all_entries()
-    embeddings = [np.asarray(entry.embedding, dtype=np.float32) for entry in entries]
-    query_embedding = get_embedding(q)
-    similarities = [cosine_similarity(query_embedding, emb) for emb in embeddings]
-    indices = np.argsort(similarities)[::-1] if similarities else []
-    results = [
-        {
-            "timestamp": entries[i].timestamp,
-            "monitor_id": entries[i].monitor_id,
-            "segment_filename": entries[i].segment_filename,
-            "segment_pts_ms": entries[i].segment_pts_ms,
-            "thumb_filename": entries[i].thumb_filename,
-            "app": entries[i].app or "",
-            "title": entries[i].title or "",
-            "text": entries[i].text or "",
-            "similarity": round(similarities[i] * 100, 1),
-        }
-        for i in indices
+    semantic_query, exact_phrases = _parse_search_query(q)
+
+    candidate_indices = [
+        index
+        for index, entry in enumerate(entries)
+        if _entry_matches_exact_phrases(entry.text or "", exact_phrases)
     ]
+
+    results = []
+    if semantic_query:
+        query_embedding = get_embedding(semantic_query)
+        scored_candidates = []
+        for index in candidate_indices:
+            emb = np.asarray(entries[index].embedding, dtype=np.float32)
+            similarity = cosine_similarity(query_embedding, emb)
+            scored_candidates.append((index, similarity))
+
+        scored_candidates.sort(key=lambda item: item[1], reverse=True)
+        for index, similarity in scored_candidates:
+            results.append(
+                {
+                    "timestamp": entries[index].timestamp,
+                    "monitor_id": entries[index].monitor_id,
+                    "segment_filename": entries[index].segment_filename,
+                    "segment_pts_ms": entries[index].segment_pts_ms,
+                    "thumb_filename": entries[index].thumb_filename,
+                    "app": entries[index].app or "",
+                    "title": entries[index].title or "",
+                    "text": entries[index].text or "",
+                    "similarity": round(similarity * 100, 1),
+                }
+            )
+    elif exact_phrases:
+        for index in candidate_indices:
+            results.append(
+                {
+                    "timestamp": entries[index].timestamp,
+                    "monitor_id": entries[index].monitor_id,
+                    "segment_filename": entries[index].segment_filename,
+                    "segment_pts_ms": entries[index].segment_pts_ms,
+                    "thumb_filename": entries[index].thumb_filename,
+                    "app": entries[index].app or "",
+                    "title": entries[index].title or "",
+                    "text": entries[index].text or "",
+                    "similarity": 100.0,
+                }
+            )
+
+        results.sort(key=lambda item: item["timestamp"], reverse=True)
 
     return render_template_string(
         """
 {% extends "base_template" %}
 {% block content %}
 <div class="container mt-3">
-  <div class="mb-3">
-    <a href="/" class="btn btn-sm btn-outline-secondary"><i class="bi bi-house"></i> Timeline</a>
-  </div>
   {% if not results %}
     <div class="alert alert-info">No results.</div>
   {% else %}
@@ -423,7 +1061,7 @@ def search():
     {% for r in results %}
     <div class="col-md-3 mb-4">
       <div class="card h-100 shadow-sm">
-        <a href="#" data-toggle="modal" data-target="#modal-{{ loop.index0 }}" class="d-block overflow-hidden"
+        <a href="#" data-result-index="{{ loop.index0 }}" class="d-block overflow-hidden search-result-open"
            style="max-height:160px;">
           <img src="/static/{{ r.thumb_filename }}" alt="thumbnail" class="card-img-top"
                style="object-fit:cover; height:160px;">
@@ -445,57 +1083,64 @@ def search():
         </div>
       </div>
     </div>
+    {% endfor %}
+  </div>
 
-    <div class="modal fade" id="modal-{{ loop.index0 }}" tabindex="-1" role="dialog" aria-hidden="true">
-      <div class="modal-dialog" role="document" style="max-width:95vw; margin:1vh auto;">
-        <div class="modal-content">
-          <div class="modal-header py-2">
-            <div>
-              <span class="badge badge-primary">{{ r.similarity }}% match</span>
-              <span class="ml-2 text-muted small">{{ r.timestamp | timestamp_to_human_readable }}</span>
-              {% if r.app %}<span class="ml-2 text-muted small">{{ r.app }}{% if r.title %} — {{ r.title }}{% endif %}</span>{% endif %}
-            </div>
-            <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
-          </div>
-          <div class="modal-body p-0" style="background:#000;">
-            <img src="/static/{{ r.thumb_filename }}" alt="thumbnail"
-               data-segment="{{ r.segment_filename }}"
-               data-pts-ms="{{ r.segment_pts_ms }}"
-              data-thumb="{{ r.thumb_filename }}"
-                 style="width:100%; max-height:80vh; object-fit:contain; display:block;">
-          </div>
-          {% if r.text %}
-          <div class="modal-footer py-2 d-block">
-            <p class="mb-1 small text-muted font-weight-bold">OCR text:</p>
-            <pre class="small mb-0" style="max-height:10rem; overflow-y:auto; white-space:pre-wrap; font-size:0.75rem;">{{ r.text }}</pre>
-          </div>
-          {% endif %}
+  <div class="modal fade" id="searchModal" tabindex="-1" role="dialog" aria-hidden="true">
+    <div class="modal-dialog" role="document" style="max-width:min(1200px, 92vw); margin:2vh auto;">
+      <div class="modal-content">
+        <div class="modal-header py-2">
+          <div id="searchModalMeta"></div>
+          <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
+        </div>
+        <div class="modal-body p-0 position-relative" style="background:#000;">
+          <button type="button" class="btn btn-sm btn-outline-light position-absolute" id="searchPrevBtn"
+                  title="Previous result (←)" style="left:10px; top:50%; transform:translateY(-50%); z-index:3;">
+            <i class="bi bi-arrow-left"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-outline-light position-absolute" id="searchNextBtn"
+                  title="Next result (→)" style="right:10px; top:50%; transform:translateY(-50%); z-index:3;">
+            <i class="bi bi-arrow-right"></i>
+          </button>
+          <img id="searchModalImage" src="" alt="thumbnail"
+               style="max-height:80vh; max-width:100%; width:100%; height:100%; object-fit:contain; display:block; margin:0 auto;">
+        </div>
+        <div class="modal-footer py-2 d-block">
+          <p class="mb-1 small text-muted font-weight-bold">OCR text:</p>
+          <pre id="searchModalText" class="small mb-0" style="max-height:10rem; overflow-y:auto; white-space:pre-wrap; font-size:0.75rem;"></pre>
         </div>
       </div>
     </div>
-    {% endfor %}
   </div>
   {% endif %}
 </div>
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {
-  const fullFrameRetryCount = 2;
-  const fullFrameRetryDelayMs = 220;
+  const results = {{ results|tojson }};
+  const fullFrameRetryCount = 8;
+  const fullFrameRetryDelayMs = 280;
+  const modalId = '#searchModal';
+  const image = document.getElementById('searchModalImage');
+  const text = document.getElementById('searchModalText');
+  const meta = document.getElementById('searchModalMeta');
+  const prevBtn = document.getElementById('searchPrevBtn');
+  const nextBtn = document.getElementById('searchNextBtn');
+  let currentIndex = -1;
 
-  function upgradeModalImage(modalElement) {
-    const image = modalElement.querySelector('img[data-segment]');
+  function buildFrameUrl(result) {
+    return '/frame?segment=' + encodeURIComponent(result.segment_filename) +
+      '&pts_ms=' + encodeURIComponent(result.segment_pts_ms || 0) +
+      '&thumb=' + encodeURIComponent(result.thumb_filename || '');
+  }
+
+  function upgradeModalImage(result) {
     if (!image || image.dataset.fullLoaded === '1' || image.dataset.fullLoading === '1') {
       return;
     }
     image.dataset.fullLoading = '1';
 
-    const segment = image.dataset.segment;
-    const ptsMs = image.dataset.ptsMs || '0';
-    const thumb = image.dataset.thumb || '';
-    const frameUrl = '/frame?segment=' + encodeURIComponent(segment) +
-             '&pts_ms=' + encodeURIComponent(ptsMs) +
-             '&thumb=' + encodeURIComponent(thumb);
+    const frameUrl = buildFrameUrl(result);
 
     function tryLoadFullFrame(attempt) {
       const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
@@ -520,28 +1165,100 @@ document.addEventListener('DOMContentLoaded', function() {
     tryLoadFullFrame(0);
   }
 
+  function updateNavButtons() {
+    if (!prevBtn || !nextBtn) {
+      return;
+    }
+    prevBtn.disabled = currentIndex <= 0;
+    nextBtn.disabled = currentIndex >= results.length - 1;
+  }
+
+  function renderResult(index) {
+    if (index < 0 || index >= results.length) {
+      return;
+    }
+    currentIndex = index;
+    const result = results[index];
+
+    image.src = '/static/' + result.thumb_filename;
+    image.dataset.fullLoaded = '0';
+    image.dataset.fullLoading = '0';
+
+    const appTitle = result.app
+      ? ' <span class="ml-2 text-muted small">' + result.app + (result.title ? ' — ' + result.title : '') + '</span>'
+      : '';
+
+    meta.innerHTML =
+      '<span class="badge badge-primary">' + result.similarity + '% match</span>' +
+      '<span class="ml-2 text-muted small">' + new Date(result.timestamp * 1000).toLocaleString() + '</span>' +
+      appTitle;
+
+    text.textContent = result.text || 'No OCR text.';
+    updateNavButtons();
+    setTimeout(function() {
+      upgradeModalImage(result);
+    }, 120);
+  }
+
+  function showResult(index) {
+    renderResult(index);
+    if (window.jQuery) {
+      window.jQuery(modalId).modal('show');
+    }
+  }
+
+  function navigate(delta) {
+    if (currentIndex < 0) {
+      return;
+    }
+    const nextIndex = currentIndex + delta;
+    if (nextIndex < 0 || nextIndex >= results.length) {
+      return;
+    }
+    renderResult(nextIndex);
+  }
+
   if (window.jQuery) {
-    window.jQuery('.modal').on('shown.bs.modal', function() {
-      upgradeModalImage(this);
+    window.jQuery(modalId).on('shown.bs.modal', function() {
+      if (currentIndex >= 0) {
+        upgradeModalImage(results[currentIndex]);
+      }
     });
   }
 
-  document.querySelectorAll('[data-toggle="modal"][data-target]').forEach(function(trigger) {
-    trigger.addEventListener('click', function() {
-      const targetSelector = trigger.getAttribute('data-target');
-      if (!targetSelector) {
-        return;
-      }
-
-      const modalElement = document.querySelector(targetSelector);
-      if (!modalElement) {
-        return;
-      }
-
-      setTimeout(function() {
-        upgradeModalImage(modalElement);
-      }, 150);
+  document.querySelectorAll('.search-result-open[data-result-index]').forEach(function(trigger) {
+    trigger.addEventListener('click', function(event) {
+      event.preventDefault();
+      const idx = Number(trigger.getAttribute('data-result-index'));
+      showResult(idx);
     });
+  });
+
+  if (prevBtn) {
+    prevBtn.addEventListener('click', function() {
+      navigate(-1);
+    });
+  }
+
+  if (nextBtn) {
+    nextBtn.addEventListener('click', function() {
+      navigate(1);
+    });
+  }
+
+  document.addEventListener('keydown', function(event) {
+    const modalElement = document.querySelector(modalId);
+    if (!modalElement || !modalElement.classList.contains('show')) {
+      return;
+    }
+
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      navigate(-1);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      navigate(1);
+    }
   });
 });
 </script>
@@ -734,6 +1451,7 @@ def api_stats():
 @app.route("/api/status")
 def api_status():
     """Returns live capture loop state as JSON."""
+    paused_until_ts = int(capture_state.get("paused_until_ts") or 0)
     return jsonify(
         _json_safe(
             {
@@ -741,9 +1459,55 @@ def api_status():
                 "captures_this_session": capture_state["captures_this_session"],
                 "last_mssim": capture_state["last_mssim"],
                 "recent_timings": list(capture_state["recent_timings"]),
+                "paused_until_ts": paused_until_ts,
+                "is_paused": is_capture_paused(),
+                "stop_requested": bool(capture_state.get("stop_requested")),
             }
         )
     )
+
+
+@app.route("/api/capture/pause", methods=["POST"])
+def api_capture_pause():
+    """Pauses capture loop for requested number of minutes."""
+    payload = request.get_json(silent=True) or {}
+    minutes = payload.get("minutes", 15)
+    try:
+        minutes_int = max(1, int(minutes))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid minutes"}), 400
+
+    paused_until_ts = set_capture_pause_for_seconds(minutes_int * 60)
+    return jsonify({"ok": True, "paused_until_ts": paused_until_ts})
+
+
+@app.route("/api/capture/resume", methods=["POST"])
+def api_capture_resume():
+    """Resumes capture loop immediately."""
+    clear_capture_pause()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hard-stop", methods=["POST"])
+def api_hard_stop():
+    """Stops capture loop and terminates the process shortly after response."""
+    clear_capture_pause()
+    request_capture_stop()
+
+    def delayed_exit() -> None:
+        import time
+
+        time.sleep(0.3)
+        os._exit(0)
+
+    Thread(target=delayed_exit, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/recovery-status")
+def api_recovery_status():
+    """Returns startup segment recovery summary."""
+    return jsonify(_json_safe(startup_recovery_state))
 
 
 @app.route("/api/ocr-ab-compare")
@@ -769,6 +1533,103 @@ def open_folder():
         return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)})
+
+
+def _parse_config_form_value(raw_value: str) -> object:
+    """Parses posted config string into bool/int/float/string value."""
+    value = (raw_value or "").strip()
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+@app.route("/config", methods=["GET", "POST"])
+def config_page():
+    """Shows and persists runtime configuration values."""
+    save_error = ""
+    save_success = ""
+
+    effective_values = get_runtime_config_values()
+    if request.method == "POST":
+        new_values = {}
+        for key in RUNTIME_CONFIG_KEYS:
+            if key in request.form:
+                new_values[key] = _parse_config_form_value(request.form.get(key, ""))
+
+        try:
+            write_runtime_config_file(new_values)
+            save_success = "Saved config file. Restart app to apply changes."
+            effective_values = {**effective_values, **new_values}
+        except OSError as exc:
+            save_error = f"Failed saving config: {exc}"
+
+    return render_template_string(
+        """
+{% extends "base_template" %}
+{% block content %}
+<div class="container mt-3">
+  <h5>Configuration</h5>
+  <p class="text-muted small mb-2">
+    Config file: {{ config_file_path }}. Environment variables still override file values.
+  </p>
+  <p class="text-muted small">
+    Most settings are loaded at startup. Save here, then restart OpenRecall.
+  </p>
+  <p class="text-muted small">
+    Live apply is intentionally minimal right now; treat this page as startup configuration.
+  </p>
+
+  <div class="card mb-3">
+    <div class="card-body py-2">
+      <div class="small text-muted mb-1">Startup-only CLI settings (not persisted here):</div>
+      <div class="small"><strong>storage_path:</strong> {{ cli_values.storage_path }}</div>
+      <div class="small"><strong>primary_monitor_only:</strong> {{ cli_values.primary_monitor_only }}</div>
+    </div>
+  </div>
+
+  {% if save_error %}
+    <div class="alert alert-danger py-2">{{ save_error }}</div>
+  {% endif %}
+  {% if save_success %}
+    <div class="alert alert-success py-2">{{ save_success }}</div>
+  {% endif %}
+
+  <form method="post" action="/config">
+    <div class="card">
+      <div class="card-body">
+        <div class="form-row">
+          {% for key, value in effective_values.items() %}
+          <div class="form-group col-md-6">
+            <label for="cfg-{{ key }}" class="small font-weight-bold mb-1">{{ key }}</label>
+            <input id="cfg-{{ key }}" name="{{ key }}" class="form-control form-control-sm" value="{{ value }}">
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="card-footer d-flex justify-content-between align-items-center">
+        <small class="text-muted">Changes are persisted to JSON config and applied on next startup.</small>
+        <button type="submit" class="btn btn-sm btn-primary">Save</button>
+      </div>
+    </div>
+  </form>
+</div>
+{% endblock %}
+""",
+        config_file_path=config_file_path,
+        effective_values=effective_values,
+        cli_values={
+          "storage_path": args.storage_path or "(default appdata path)",
+          "primary_monitor_only": bool(args.primary_monitor_only),
+        },
+        save_error=save_error,
+        save_success=save_success,
+    )
 
 
 @app.route("/metrics")
@@ -891,6 +1752,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     create_db()
+    _recover_recent_corrupt_segments()
 
     print(f"Appdata folder: {appdata_folder}")
 

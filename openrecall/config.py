@@ -1,8 +1,9 @@
 import argparse
+import json
 import os
 import subprocess
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 parser = argparse.ArgumentParser(description="OpenRecall")
 
@@ -51,6 +52,20 @@ def _get_env_float(name: str, default: float, minimum: float) -> float:
         return default
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    """Reads a boolean env var with fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def get_appdata_folder(app_name="openrecall"):
     if sys.platform == "win32":
         appdata = os.getenv("APPDATA")
@@ -65,29 +80,6 @@ def get_appdata_folder(app_name="openrecall"):
         path = os.path.join(home, ".local", "share", app_name)
     os.makedirs(path, exist_ok=True)
     return path
-
-
-OPENRECALL_STORAGE_BACKEND = (os.getenv("OPENRECALL_STORAGE_BACKEND") or "av1_hybrid").strip()
-OPENRECALL_FFMPEG_BIN = (os.getenv("OPENRECALL_FFMPEG_BIN") or "ffmpeg").strip()
-OPENRECALL_AV1_CRF = _get_env_int("OPENRECALL_AV1_CRF", default=38, minimum=0, maximum=63)
-OPENRECALL_AV1_PRESET = (os.getenv("OPENRECALL_AV1_PRESET") or "8").strip()
-OPENRECALL_AV1_SEGMENT_SECONDS = _get_env_float(
-    "OPENRECALL_AV1_SEGMENT_SECONDS",
-    default=120.0,
-    minimum=1.0,
-)
-OPENRECALL_THUMB_QUALITY = _get_env_int(
-    "OPENRECALL_THUMB_QUALITY",
-    default=8,
-    minimum=1,
-    maximum=100,
-)
-OPENRECALL_THUMB_MAX_DIMENSION = _get_env_int(
-    "OPENRECALL_THUMB_MAX_DIMENSION",
-    default=320,
-    minimum=64,
-    maximum=4096,
-)
 
 
 if args.storage_path:
@@ -105,6 +97,181 @@ screenshots_path = thumbnails_path
 
 for storage_dir in (appdata_folder, media_path, segments_path, thumbnails_path):
     os.makedirs(storage_dir, exist_ok=True)
+
+
+config_file_path = os.path.join(appdata_folder, "openrecall_config.json")
+
+
+def _load_config_file(path: str) -> Dict[str, object]:
+    """Loads JSON config map from disk, returning empty map on invalid/missing file."""
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            loaded = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return loaded if isinstance(loaded, dict) else {}
+
+
+_file_config = _load_config_file(config_file_path)
+
+
+def _get_setting_raw(name: str):
+    env_value = os.getenv(name)
+    if env_value is not None:
+        return env_value
+    return _file_config.get(name)
+
+
+def _get_config_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: Optional[int] = None,
+) -> int:
+    raw_value = _get_setting_raw(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except (ValueError, TypeError):
+        return default
+
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _get_config_float(name: str, default: float, minimum: float) -> float:
+    raw_value = _get_setting_raw(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return max(minimum, float(raw_value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _get_config_str(name: str, default: str) -> str:
+    raw_value = _get_setting_raw(name)
+    if raw_value is None:
+        return default
+    value = str(raw_value).strip()
+    return value if value else default
+
+
+def _get_config_bool(name: str, default: bool) -> bool:
+    raw_value = _get_setting_raw(name)
+    if raw_value is None:
+        return default
+
+    if isinstance(raw_value, bool):
+        return raw_value
+
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+OPENRECALL_STORAGE_BACKEND = _get_config_str("OPENRECALL_STORAGE_BACKEND", "av1_hybrid")
+OPENRECALL_FFMPEG_BIN = _get_config_str("OPENRECALL_FFMPEG_BIN", "ffmpeg")
+OPENRECALL_AV1_CRF = _get_config_int("OPENRECALL_AV1_CRF", default=38, minimum=0, maximum=63)
+OPENRECALL_AV1_PRESET = _get_config_str("OPENRECALL_AV1_PRESET", "8")
+OPENRECALL_AV1_PLAYBACK_FPS = _get_config_float(
+    "OPENRECALL_AV1_PLAYBACK_FPS",
+    default=2.0,
+    minimum=0.1,
+)
+OPENRECALL_AV1_SEGMENT_SECONDS = _get_config_float(
+    "OPENRECALL_AV1_SEGMENT_SECONDS",
+    default=120.0,
+    minimum=1.0,
+)
+OPENRECALL_THUMB_QUALITY = _get_config_int(
+    "OPENRECALL_THUMB_QUALITY",
+    default=8,
+    minimum=1,
+    maximum=100,
+)
+OPENRECALL_THUMB_MAX_DIMENSION = _get_config_int(
+    "OPENRECALL_THUMB_MAX_DIMENSION",
+    default=320,
+    minimum=64,
+    maximum=4096,
+)
+
+OPENRECALL_CAPTURE_INTERVAL_SECONDS = _get_config_float(
+    "OPENRECALL_CAPTURE_INTERVAL_SECONDS",
+    default=60.0,
+    minimum=1.0,
+)
+OPENRECALL_AV1_SEGMENT_FRAMES = _get_config_int(
+    "OPENRECALL_AV1_SEGMENT_FRAMES",
+    default=30,
+    minimum=1,
+)
+OPENRECALL_SIMILARITY_FRAME_WIDTH = _get_config_int(
+    "OPENRECALL_SIMILARITY_FRAME_WIDTH",
+    default=0,
+    minimum=0,
+)
+OPENRECALL_VERBOSE_CAPTURE_LOGS = _get_config_bool(
+    "OPENRECALL_VERBOSE_CAPTURE_LOGS",
+    default=False,
+)
+
+RUNTIME_CONFIG_KEYS = [
+    "OPENRECALL_STORAGE_BACKEND",
+    "OPENRECALL_FFMPEG_BIN",
+    "OPENRECALL_AV1_CRF",
+    "OPENRECALL_AV1_PRESET",
+    "OPENRECALL_AV1_PLAYBACK_FPS",
+    "OPENRECALL_AV1_SEGMENT_SECONDS",
+    "OPENRECALL_THUMB_QUALITY",
+    "OPENRECALL_THUMB_MAX_DIMENSION",
+    "OPENRECALL_CAPTURE_INTERVAL_SECONDS",
+    "OPENRECALL_AV1_SEGMENT_FRAMES",
+    "OPENRECALL_SIMILARITY_FRAME_WIDTH",
+    "OPENRECALL_VERBOSE_CAPTURE_LOGS",
+]
+
+
+def get_runtime_config_values() -> Dict[str, object]:
+    """Returns effective runtime config values currently loaded by this process."""
+    return {
+        "OPENRECALL_STORAGE_BACKEND": OPENRECALL_STORAGE_BACKEND,
+        "OPENRECALL_FFMPEG_BIN": OPENRECALL_FFMPEG_BIN,
+        "OPENRECALL_AV1_CRF": OPENRECALL_AV1_CRF,
+        "OPENRECALL_AV1_PRESET": OPENRECALL_AV1_PRESET,
+        "OPENRECALL_AV1_PLAYBACK_FPS": OPENRECALL_AV1_PLAYBACK_FPS,
+        "OPENRECALL_AV1_SEGMENT_SECONDS": OPENRECALL_AV1_SEGMENT_SECONDS,
+        "OPENRECALL_THUMB_QUALITY": OPENRECALL_THUMB_QUALITY,
+        "OPENRECALL_THUMB_MAX_DIMENSION": OPENRECALL_THUMB_MAX_DIMENSION,
+        "OPENRECALL_CAPTURE_INTERVAL_SECONDS": OPENRECALL_CAPTURE_INTERVAL_SECONDS,
+        "OPENRECALL_AV1_SEGMENT_FRAMES": OPENRECALL_AV1_SEGMENT_FRAMES,
+        "OPENRECALL_SIMILARITY_FRAME_WIDTH": OPENRECALL_SIMILARITY_FRAME_WIDTH,
+        "OPENRECALL_VERBOSE_CAPTURE_LOGS": OPENRECALL_VERBOSE_CAPTURE_LOGS,
+    }
+
+
+def write_runtime_config_file(new_values: Dict[str, object]) -> None:
+    """Writes persistent JSON config file used on next process startup."""
+    payload = {
+        key: new_values[key]
+        for key in RUNTIME_CONFIG_KEYS
+        if key in new_values
+    }
+    with open(config_file_path, "w", encoding="utf-8") as config_file:
+        json.dump(payload, config_file, indent=2, sort_keys=True)
 
 
 def _run_ffmpeg_command(ffmpeg_bin: str, ffmpeg_args: List[str]) -> str:

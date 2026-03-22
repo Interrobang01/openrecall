@@ -10,12 +10,16 @@ import numpy as np
 from PIL import Image
 
 from openrecall.config import (
+    OPENRECALL_CAPTURE_INTERVAL_SECONDS,
     OPENRECALL_AV1_CRF,
     OPENRECALL_AV1_PRESET,
-    OPENRECALL_AV1_SEGMENT_SECONDS,
+    OPENRECALL_AV1_PLAYBACK_FPS,
+    OPENRECALL_AV1_SEGMENT_FRAMES,
     OPENRECALL_FFMPEG_BIN,
+    OPENRECALL_SIMILARITY_FRAME_WIDTH,
     OPENRECALL_THUMB_MAX_DIMENSION,
     OPENRECALL_THUMB_QUALITY,
+    OPENRECALL_VERBOSE_CAPTURE_LOGS,
     args,
     segments_path,
     thumbnails_path,
@@ -38,71 +42,41 @@ capture_state: Dict[str, Any] = {
     "last_mssim": None,
     "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
     "last_ocr_ab_compare": None,
+    "paused_until_ts": 0,
+    "stop_requested": False,
 }
+
+
+def set_capture_pause_for_seconds(pause_seconds: int) -> int:
+    """Pauses capture loop for requested seconds and returns pause-until timestamp."""
+    pause_until_ts = int(time.time()) + max(0, pause_seconds)
+    capture_state["paused_until_ts"] = pause_until_ts
+    return pause_until_ts
+
+
+def clear_capture_pause() -> None:
+    """Resumes capture loop by clearing active pause."""
+    capture_state["paused_until_ts"] = 0
+
+
+def request_capture_stop() -> None:
+    """Requests the capture loop to terminate gracefully."""
+    capture_state["stop_requested"] = True
+
+
+def is_capture_paused(now_ts: Optional[int] = None) -> bool:
+    """Returns whether capture is currently paused."""
+    now = int(time.time()) if now_ts is None else now_ts
+    return now < int(capture_state.get("paused_until_ts") or 0)
 
 
 def _capture_print(message: str) -> None:
     """Prints a flushed capture event message for CLI visibility."""
-    if VERBOSE_CAPTURE_LOGS:
+    if OPENRECALL_VERBOSE_CAPTURE_LOGS:
         print(f"[openrecall.capture] {message}", flush=True)
 
-
-def _get_env_int(name: str, default: int, minimum: int) -> int:
-    """Reads an integer env var with bounds and fallback."""
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-
-    try:
-        return max(minimum, int(raw_value))
-    except ValueError:
-        logger.warning("Invalid %s value '%s'. Falling back to %s.", name, raw_value, default)
-        return default
-
-
-def _get_env_float(name: str, default: float, minimum: float) -> float:
-    """Reads a float env var with bounds and fallback."""
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-
-    try:
-        return max(minimum, float(raw_value))
-    except ValueError:
-        logger.warning("Invalid %s value '%s'. Falling back to %.2f.", name, raw_value, default)
-        return default
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    """Reads a boolean env var with fallback."""
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-
-    logger.warning("Invalid %s value '%s'. Falling back to %s.", name, raw_value, default)
-    return default
-
-
-CAPTURE_INTERVAL_SECONDS: float = _get_env_float(
-    "OPENRECALL_CAPTURE_INTERVAL_SECONDS", default=3.0, minimum=1.0
-)
-SIMILARITY_FRAME_WIDTH: int = _get_env_int(
-    "OPENRECALL_SIMILARITY_FRAME_WIDTH", default=0, minimum=0
-)
-OCR_MAX_DIMENSION: int = _get_env_int(
-    "OPENRECALL_OCR_MAX_DIMENSION", default=0, minimum=0
-)
-VERBOSE_CAPTURE_LOGS: bool = _get_env_bool(
-    "OPENRECALL_VERBOSE_CAPTURE_LOGS", default=False
-)
-
 THUMB_MAX_DIMENSION = OPENRECALL_THUMB_MAX_DIMENSION
+AV1_SEGMENT_FRAMES = OPENRECALL_AV1_SEGMENT_FRAMES
 
 
 class MonitorAv1SegmentWriter:
@@ -117,12 +91,10 @@ class MonitorAv1SegmentWriter:
         self._process: Optional[subprocess.Popen] = None
         self._segment_frame_index: int = 0
 
-    def _is_expired(self, timestamp_ms: int) -> bool:
+    def _is_expired(self) -> bool:
         if self.segment_started_at_ms is None:
             return True
-        return (timestamp_ms - self.segment_started_at_ms) >= int(
-            OPENRECALL_AV1_SEGMENT_SECONDS * 1000
-        )
+        return self._segment_frame_index >= AV1_SEGMENT_FRAMES
 
     def close(self) -> None:
         """Closes the active ffmpeg segment process if present."""
@@ -171,7 +143,7 @@ class MonitorAv1SegmentWriter:
         self._segment_frame_index = 0
 
         segment_filepath = os.path.join(segments_path, self.segment_filename)
-        fps = 1.0 / CAPTURE_INTERVAL_SECONDS
+        fps = OPENRECALL_AV1_PLAYBACK_FPS
 
         ffmpeg_command = [
             OPENRECALL_FFMPEG_BIN,
@@ -217,7 +189,7 @@ class MonitorAv1SegmentWriter:
             self._process is None
             or self._width != width
             or self._height != height
-            or self._is_expired(timestamp_ms)
+            or self._is_expired()
         )
 
         if should_rotate:
@@ -248,7 +220,7 @@ class MonitorAv1SegmentWriter:
                 f"ffmpeg AV1 writer failed for monitor {self.monitor_id}: {stderr_text}"
             ) from exc
 
-        segment_pts_ms = int(round(self._segment_frame_index * CAPTURE_INTERVAL_SECONDS * 1000.0))
+        segment_pts_ms = int(round(self._segment_frame_index * (1000.0 / OPENRECALL_AV1_PLAYBACK_FPS)))
         self._segment_frame_index += 1
         return self.segment_filename, segment_pts_ms
 
@@ -280,29 +252,14 @@ def _save_thumbnail(image: np.ndarray, capture_id_ms: int, monitor_id: int) -> s
     return thumb_filename
 
 
-def _resize_for_ocr(image: np.ndarray, max_dimension: int = OCR_MAX_DIMENSION) -> np.ndarray:
-    """Resizes the image for OCR if its longest side is larger than max_dimension."""
-    height, width = image.shape[:2]
-    longest_side = max(height, width)
-
-    if max_dimension <= 0:
-        return image
-
-    if longest_side <= max_dimension:
-        return image
-
-    scale = max_dimension / float(longest_side)
-    resized_width = max(1, int(width * scale))
-    resized_height = max(1, int(height * scale))
-    resized_image = Image.fromarray(image).resize(
-        (resized_width, resized_height),
-        Image.Resampling.BILINEAR,
-    )
-    return np.asarray(resized_image)
+def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
+    """Returns original image for OCR (no downscaling)."""
+    return image
 
 
 def _prepare_similarity_frame(
-    image: np.ndarray, target_width: int = SIMILARITY_FRAME_WIDTH
+    image: np.ndarray,
+    target_width: int = OPENRECALL_SIMILARITY_FRAME_WIDTH,
 ) -> np.ndarray:
     """Builds a compact grayscale frame used for cheap similarity checks."""
     height, width = image.shape[:2]
@@ -413,9 +370,6 @@ def record_screenshots_thread() -> None:
     screenshots, associated OCR text, embeddings, and active application info.
     Runs in an infinite loop, intended to be executed in a separate thread.
     """
-    # TODO: Move this environment variable setting to the application's entry point.
-    # HACK: Prevents a warning/error from the huggingface/tokenizers library
-    # when used in environments where multiprocessing fork safety is a concern.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     initial_screenshots = take_screenshots()
@@ -428,8 +382,22 @@ def record_screenshots_thread() -> None:
 
     try:
         while True:
+            if capture_state.get("stop_requested"):
+                break
+
+            now_ts = int(time.time())
+            if is_capture_paused(now_ts):
+                for monitor_id, writer in list(segment_writers.items()):
+                    try:
+                        writer.close()
+                    except RuntimeError as exc:
+                        logger.warning("Failed closing AV1 writer for monitor %s: %s", monitor_id, exc)
+                    del segment_writers[monitor_id]
+                time.sleep(1.0)
+                continue
+
             if not is_user_active():
-                time.sleep(CAPTURE_INTERVAL_SECONDS)
+                time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
                 continue
 
             current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
@@ -457,7 +425,7 @@ def record_screenshots_thread() -> None:
                     monitor_id: _prepare_similarity_frame(screenshot)
                     for monitor_id, screenshot in current_screenshots
                 }
-                time.sleep(CAPTURE_INTERVAL_SECONDS)
+                time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
                 continue
 
             for monitor_id, current_screenshot in current_screenshots:
@@ -583,7 +551,7 @@ def record_screenshots_thread() -> None:
                         f"captures_this_session={capture_state['captures_this_session']}"
                     )
 
-            time.sleep(CAPTURE_INTERVAL_SECONDS)
+            time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
     finally:
         for monitor_id, writer in segment_writers.items():
             try:

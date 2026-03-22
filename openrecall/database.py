@@ -1,7 +1,7 @@
 import sqlite3
 from collections import namedtuple
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from openrecall.config import db_path
 
@@ -278,6 +278,60 @@ def get_segment_frame_index(segment_filename: str, thumb_filename: str) -> Optio
         print(f"Database error while resolving segment frame index: {e}")
 
     return frame_index
+
+
+def get_media_entries_for_segments(segment_filenames: List[str]) -> List[Tuple[str, str]]:
+    """Returns (segment_filename, thumb_filename) pairs for selected segments."""
+    if not segment_filenames:
+        return []
+
+    media_entries: List[Tuple[str, str]] = []
+    unique_segments = sorted(set(segment_filenames))
+    placeholders = ",".join("?" for _ in unique_segments)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT segment_filename, thumb_filename
+                FROM entries
+                WHERE segment_filename IN ({placeholders})
+                """,
+                unique_segments,
+            )
+            media_entries = [(row[0], row[1]) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        print(f"Database error while fetching media entries for segments: {e}")
+
+    return media_entries
+
+
+def delete_entries_by_segment_filenames(segment_filenames: List[str]) -> int:
+    """Deletes entries whose segment_filename is in segment_filenames."""
+    if not segment_filenames:
+        return 0
+
+    unique_segments = sorted(set(segment_filenames))
+    placeholders = ",".join("?" for _ in unique_segments)
+    deleted_count = 0
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                DELETE FROM entries
+                WHERE segment_filename IN ({placeholders})
+                """,
+                unique_segments,
+            )
+            conn.commit()
+            deleted_count = cursor.rowcount
+    except sqlite3.Error as e:
+        print(f"Database error while deleting entries by segment filename: {e}")
+
+    return deleted_count
 
 
 def insert_entry(
