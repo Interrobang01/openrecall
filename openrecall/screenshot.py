@@ -2,7 +2,7 @@ import collections
 import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import mss
 import numpy as np
@@ -158,16 +158,17 @@ def is_similar(
     return similarity >= similarity_threshold
 
 
-def take_screenshots() -> List[np.ndarray]:
+def take_screenshots() -> List[Tuple[int, np.ndarray]]:
     """Takes screenshots of all connected monitors or just the primary one.
 
     Depending on the `args.primary_monitor_only` flag, captures either
     all monitors or only the primary monitor (index 1 in mss.monitors).
 
     Returns:
-        A list of screenshots, where each screenshot is a NumPy array (RGB).
+        A list of (monitor_id, screenshot) tuples, where each screenshot
+        is a NumPy array (RGB).
     """
-    screenshots: List[np.ndarray] = []
+    screenshots: List[Tuple[int, np.ndarray]] = []
     with mss.mss() as sct:
         # sct.monitors[0] is the combined view of all monitors
         # sct.monitors[1] is the primary monitor
@@ -185,7 +186,7 @@ def take_screenshots() -> List[np.ndarray]:
                 sct_img = sct.grab(monitor_info)
                 # Convert to numpy array and change BGRA to RGB
                 screenshot = np.array(sct_img)[:, :, [2, 1, 0]]
-                screenshots.append(screenshot)
+                screenshots.append((i, screenshot))
             else:
                 # Handle case where primary_monitor_only is True but only one monitor exists (all monitors view)
                 # This case might need specific handling depending on desired behavior.
@@ -208,9 +209,11 @@ def record_screenshots_thread() -> None:
     # when used in environments where multiprocessing fork safety is a concern.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    last_similarity_frames: List[np.ndarray] = [
-        _prepare_similarity_frame(screenshot) for screenshot in take_screenshots()
-    ]
+    initial_screenshots = take_screenshots()
+    last_similarity_frames: Dict[int, np.ndarray] = {
+        monitor_id: _prepare_similarity_frame(screenshot)
+        for monitor_id, screenshot in initial_screenshots
+    }
     _capture_print(f"screenshots_taken monitors={len(last_similarity_frames)}")
 
     while True:
@@ -218,46 +221,47 @@ def record_screenshots_thread() -> None:
             time.sleep(CAPTURE_INTERVAL_SECONDS)
             continue
 
-        current_screenshots: List[np.ndarray] = take_screenshots()
+        current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
         _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
+
+        current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
 
         # Ensure we have a last frame for each current screenshot.
         # This handles cases where monitor setup might change (though unlikely mid-run)
-        if len(last_similarity_frames) != len(current_screenshots):
+        if set(last_similarity_frames.keys()) != current_monitor_ids:
             # If monitor count changes, reset and continue.
             _capture_print(
                 "monitor_layout_changed "
                 f"previous={len(last_similarity_frames)} current={len(current_screenshots)}"
             )
-            last_similarity_frames = [
-                _prepare_similarity_frame(screenshot)
-                for screenshot in current_screenshots
-            ]
+            last_similarity_frames = {
+                monitor_id: _prepare_similarity_frame(screenshot)
+                for monitor_id, screenshot in current_screenshots
+            }
             time.sleep(CAPTURE_INTERVAL_SECONDS)
             continue
 
-
-        for i, current_screenshot in enumerate(current_screenshots):
+        for monitor_id, current_screenshot in current_screenshots:
             t_frame_start = time.perf_counter()
             current_similarity_frame = _prepare_similarity_frame(current_screenshot)
-            last_similarity_frame = last_similarity_frames[i]
+            last_similarity_frame = last_similarity_frames[monitor_id]
 
             mssim_val = mean_structured_similarity_index(current_similarity_frame, last_similarity_frame)
             t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
             capture_state["last_mssim"] = round(mssim_val, 4)
             _capture_print(
-                f"similarity_checked monitor={i + 1} mssim={mssim_val:.4f} "
+                f"similarity_checked monitor={monitor_id} mssim={mssim_val:.4f} "
                 f"mssim_ms={t_mssim_ms:.1f}"
             )
 
             if mssim_val < 0.9:
-                last_similarity_frames[i] = current_similarity_frame
+                last_similarity_frames[monitor_id] = current_similarity_frame
                 image = Image.fromarray(current_screenshot)
                 timestamp = int(time.time())
-                filename = f"{timestamp}.webp"
+                filename = f"{timestamp}_m{monitor_id}.webp"
                 filepath = os.path.join(screenshots_path, filename)
                 _capture_print(
-                    f"capture_changed monitor={i + 1} timestamp={timestamp} file={filepath}"
+                    f"capture_changed monitor={monitor_id} timestamp={timestamp} file={filepath}"
                 )
                 image.save(
                     filepath,
@@ -265,41 +269,49 @@ def record_screenshots_thread() -> None:
                     lossless=True,
                 )
 
-                _capture_print(f"ocr_start monitor={i + 1} timestamp={timestamp}")
+                _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
                 t_ocr_start = time.perf_counter()
                 ocr_input = _resize_for_ocr(current_screenshot)
                 text: str = extract_text_from_image(ocr_input)
                 t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
                 _capture_print(
-                    f"ocr_stop monitor={i + 1} timestamp={timestamp} "
+                    f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
                     f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
                 )
 
                 t_embed_ms = 0.0
                 t_db_ms = 0.0
                 if text.strip():
-                    _capture_print(f"embedding_start monitor={i + 1} timestamp={timestamp}")
+                    _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
                     t_embed_start = time.perf_counter()
                     embedding: np.ndarray = get_embedding(text)
                     t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
                     _capture_print(
-                        f"embedding_stop monitor={i + 1} timestamp={timestamp} "
+                        f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
                         f"embedding_ms={t_embed_ms:.1f}"
                     )
 
                     active_app_name: str = get_active_app_name() or "Unknown App"
                     active_window_title: str = get_active_window_title() or "Unknown Title"
 
-                    _capture_print(f"db_write_start monitor={i + 1} timestamp={timestamp}")
+                    _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
                     t_db_start = time.perf_counter()
-                    insert_entry(text, timestamp, embedding, active_app_name, active_window_title)
+                    insert_entry(
+                        text,
+                        timestamp,
+                        embedding,
+                        active_app_name,
+                        active_window_title,
+                        monitor_id=monitor_id,
+                        image_filename=filename,
+                    )
                     t_db_ms = (time.perf_counter() - t_db_start) * 1000
                     _capture_print(
-                        f"db_write_stop monitor={i + 1} timestamp={timestamp} db_ms={t_db_ms:.1f}"
+                        f"db_write_stop monitor={monitor_id} timestamp={timestamp} db_ms={t_db_ms:.1f}"
                     )
                 else:
                     _capture_print(
-                        f"embedding_skipped monitor={i + 1} timestamp={timestamp} reason=no_text"
+                        f"embedding_skipped monitor={monitor_id} timestamp={timestamp} reason=no_text"
                     )
 
                 total_ms = (time.perf_counter() - t_frame_start) * 1000
@@ -317,7 +329,7 @@ def record_screenshots_thread() -> None:
                 capture_state["captures_this_session"] += 1
                 _capture_print(
                     "metrics "
-                    f"timestamp={timestamp} monitor={i + 1} mssim={mssim_val:.4f} "
+                    f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
                     f"mssim_ms={timing['mssim_ms']:.1f} ocr_ms={timing['ocr_ms']:.1f} "
                     f"embedding_ms={timing['embedding_ms']:.1f} db_ms={timing['db_ms']:.1f} "
                     f"total_ms={timing['total_ms']:.1f} had_text={timing['had_text']} "

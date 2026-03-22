@@ -9,7 +9,12 @@ from flask import Flask, jsonify, render_template_string, request, send_from_dir
 from jinja2 import BaseLoader
 
 from openrecall.config import appdata_folder, screenshots_path
-from openrecall.database import create_db, get_all_entries, get_timestamps
+from openrecall.database import (
+    create_db,
+    get_all_entries,
+    get_timestamps,
+    get_timeline_entries,
+)
 from openrecall.nlp import cosine_similarity, get_embedding
 from openrecall.screenshot import capture_state, record_screenshots_thread
 from openrecall.utils import human_readable_time, timestamp_to_human_readable
@@ -186,12 +191,19 @@ app.jinja_env.loader = StringLoader()
 
 @app.route("/")
 def timeline():
-    timestamps = get_timestamps()
+    timeline_entries = [
+        {
+            "timestamp": entry.timestamp,
+            "monitor_id": entry.monitor_id,
+            "image_filename": entry.image_filename,
+        }
+        for entry in get_timeline_entries()
+    ]
     return render_template_string(
         """
 {% extends "base_template" %}
 {% block content %}
-{% if timestamps|length > 0 %}
+{% if timeline_entries|length > 0 %}
 <div class="container mt-3">
 
   <!-- Date range filter -->
@@ -228,8 +240,8 @@ def timeline():
 </div>
 
 <script>
-const allTimestamps = {{ timestamps|tojson }};  // descending order
-let filtered = allTimestamps.slice();
+const allEntries = {{ timeline_entries|tojson }};  // descending order by timestamp, then monitor
+let filtered = allEntries.slice();
 
 function toLocalDatetimeInput(ts) {
   const d = new Date(ts * 1000);
@@ -242,8 +254,8 @@ function toLocalDatetimeInput(ts) {
 // Set initial date inputs to span of data
 const dateFrom = document.getElementById('dateFrom');
 const dateTo   = document.getElementById('dateTo');
-dateFrom.value = toLocalDatetimeInput(allTimestamps[allTimestamps.length - 1]);
-dateTo.value   = toLocalDatetimeInput(allTimestamps[0]);
+dateFrom.value = toLocalDatetimeInput(allEntries[allEntries.length - 1].timestamp);
+dateTo.value   = toLocalDatetimeInput(allEntries[0].timestamp);
 
 const slider       = document.getElementById('discreteSlider');
 const sliderValue  = document.getElementById('sliderValue');
@@ -253,10 +265,10 @@ const rangeInfo    = document.getElementById('rangeInfo');
 function applyFilter() {
   const from = dateFrom.value ? new Date(dateFrom.value).getTime() / 1000 : 0;
   const to   = dateTo.value   ? new Date(dateTo.value).getTime()   / 1000 : Infinity;
-  filtered = allTimestamps.filter(ts => ts >= from && ts <= to);
+  filtered = allEntries.filter(item => item.timestamp >= from && item.timestamp <= to);
   slider.max = Math.max(0, filtered.length - 1);
   slider.value = slider.max;
-  rangeInfo.textContent = filtered.length + ' of ' + allTimestamps.length + ' screenshots';
+  rangeInfo.textContent = filtered.length + ' of ' + allEntries.length + ' screenshots';
   updateDisplay();
 }
 
@@ -268,9 +280,9 @@ function updateDisplay() {
   }
   // slider goes 0 (oldest) → max (newest); filtered is desc, so index = max - slider.value
   const idx = filtered.length - 1 - parseInt(slider.value);
-  const ts  = filtered[idx];
-  sliderValue.textContent = new Date(ts * 1000).toLocaleString();
-  img.src = '/static/' + ts + '.webp';
+  const item = filtered[idx];
+  sliderValue.textContent = new Date(item.timestamp * 1000).toLocaleString() + ' · monitor ' + item.monitor_id;
+  img.src = '/static/' + item.image_filename;
   img.style.display = '';
 }
 
@@ -278,8 +290,8 @@ slider.addEventListener('input', updateDisplay);
 dateFrom.addEventListener('change', applyFilter);
 dateTo.addEventListener('change', applyFilter);
 document.getElementById('resetRange').addEventListener('click', function() {
-  dateFrom.value = toLocalDatetimeInput(allTimestamps[allTimestamps.length - 1]);
-  dateTo.value   = toLocalDatetimeInput(allTimestamps[0]);
+  dateFrom.value = toLocalDatetimeInput(allEntries[allEntries.length - 1].timestamp);
+  dateTo.value   = toLocalDatetimeInput(allEntries[0].timestamp);
   applyFilter();
 });
 
@@ -292,7 +304,7 @@ applyFilter();
 {% endif %}
 {% endblock %}
 """,
-        timestamps=timestamps,
+        timeline_entries=timeline_entries,
     )
 
 
@@ -307,6 +319,8 @@ def search():
     results = [
         {
             "timestamp": entries[i].timestamp,
+        "monitor_id": entries[i].monitor_id,
+        "image_filename": entries[i].image_filename or f"{entries[i].timestamp}.webp",
             "app": entries[i].app or "",
             "title": entries[i].title or "",
             "text": entries[i].text or "",
@@ -333,7 +347,7 @@ def search():
       <div class="card h-100 shadow-sm">
         <a href="#" data-toggle="modal" data-target="#modal-{{ loop.index0 }}" class="d-block overflow-hidden"
            style="max-height:160px;">
-          <img src="/static/{{ r.timestamp }}.webp" alt="screenshot" class="card-img-top"
+          <img src="/static/{{ r.image_filename }}" alt="screenshot" class="card-img-top"
                style="object-fit:cover; height:160px;">
         </a>
         <div class="card-body p-2">
@@ -341,6 +355,7 @@ def search():
             <span class="badge badge-primary similarity-badge">{{ r.similarity }}%</span>
             <span class="card-meta">{{ r.timestamp | timestamp_to_human_readable }}</span>
           </div>
+          <div class="card-meta">Monitor {{ r.monitor_id }}</div>
           {% if r.app %}
           <div class="card-meta text-truncate" title="{{ r.title }}">
             <i class="bi bi-app-indicator"></i> {{ r.app }}{% if r.title %} — {{ r.title }}{% endif %}
@@ -365,7 +380,7 @@ def search():
             <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
           </div>
           <div class="modal-body p-0" style="background:#000;">
-            <img src="/static/{{ r.timestamp }}.webp" alt="screenshot"
+            <img src="/static/{{ r.image_filename }}" alt="screenshot"
                  style="width:100%; max-height:80vh; object-fit:contain; display:block;">
           </div>
           {% if r.text %}

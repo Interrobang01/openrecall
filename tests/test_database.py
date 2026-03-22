@@ -21,6 +21,7 @@ with patch('openrecall.config.db_path', mock_db_path):
         create_db,
         insert_entry,
         get_all_entries,
+        get_timeline_entries,
         get_timestamps,
         Entry,
     )
@@ -67,7 +68,7 @@ class TestDatabase(unittest.TestCase):
             self.conn.close()
 
     def test_create_db(self):
-        """Test if create_db creates the table and index."""
+        """Test if create_db creates the table and expected indexes."""
         # Check if table exists
         cursor = self.conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'")
@@ -75,11 +76,19 @@ class TestDatabase(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result[0], 'entries')
 
-        # Check if index exists
+        # Check timestamp index exists
         cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_timestamp'")
         result = cursor.fetchone()
         self.assertIsNotNone(result)
         self.assertEqual(result[0], 'idx_timestamp')
+
+        # Check image filename unique index exists
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_entries_image_filename'"
+        )
+        result = cursor.fetchone()
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 'idx_entries_image_filename')
 
     def test_02_insert_entry(self):
         """Test inserting a single entry."""
@@ -95,36 +104,66 @@ class TestDatabase(unittest.TestCase):
         cursor.execute("SELECT * FROM entries WHERE id = ?", (inserted_id,))
         result = cursor.fetchone()
         self.assertIsNotNone(result)
-        # (id, app, title, text, timestamp, embedding_blob)
+        # (id, app, title, text, timestamp, monitor_id, image_filename, embedding_blob)
         self.assertEqual(result[1], "TestApp")
         self.assertEqual(result[2], "TestTitle")
         self.assertEqual(result[3], "Test text")
         self.assertEqual(result[4], ts)
-        retrieved_embedding = np.frombuffer(result[5], dtype=np.float32)
+        self.assertEqual(result[5], 1)
+        self.assertEqual(result[6], f"{ts}_m1.webp")
+        retrieved_embedding = np.frombuffer(result[7], dtype=np.float32)
         np.testing.assert_array_almost_equal(retrieved_embedding, embedding)
 
-    def test_insert_duplicate_timestamp(self):
-        """Test inserting an entry with a duplicate timestamp (should be ignored)."""
+    def test_insert_same_timestamp_multiple_monitors(self):
+        """Test inserting same timestamp for different monitors."""
         ts = int(time.time())
         embedding1 = np.array([0.1, 0.2, 0.3], dtype=np.float32)
         embedding2 = np.array([0.4, 0.5, 0.6], dtype=np.float32)
 
-        id1 = insert_entry("First text", ts, embedding1, "App1", "Title1")
+        id1 = insert_entry(
+            "First text",
+            ts,
+            embedding1,
+            "App1",
+            "Title1",
+            monitor_id=1,
+            image_filename=f"{ts}_m1.webp",
+        )
         self.assertIsNotNone(id1)
 
-        # Try inserting another entry with the same timestamp
-        id2 = insert_entry("Second text", ts, embedding2, "App2", "Title2")
-        self.assertIsNone(id2, "Inserting duplicate timestamp should return None")
+        id2 = insert_entry(
+            "Second text",
+            ts,
+            embedding2,
+            "App2",
+            "Title2",
+            monitor_id=2,
+            image_filename=f"{ts}_m2.webp",
+        )
+        self.assertIsNotNone(id2)
 
-        # Verify only the first entry exists
+        # Verify both entries exist for same timestamp
         cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM entries WHERE timestamp = ?", (ts,))
         count = cursor.fetchone()[0]
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
 
-        cursor.execute("SELECT text FROM entries WHERE timestamp = ?", (ts,))
-        text = cursor.fetchone()[0]
-        self.assertEqual(text, "First text") # Ensure the first one was kept
+    def test_insert_duplicate_image_filename(self):
+        """Test inserting an entry with duplicate image filename (should be ignored)."""
+        ts = int(time.time())
+        embedding = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        image_filename = f"{ts}_m1.webp"
+
+        id1 = insert_entry("First text", ts, embedding, "App1", "Title1", 1, image_filename)
+        self.assertIsNotNone(id1)
+
+        id2 = insert_entry("Second text", ts, embedding, "App2", "Title2", 1, image_filename)
+        self.assertIsNone(id2, "Inserting duplicate image filename should return None")
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM entries WHERE image_filename = ?", (image_filename,))
+        count = cursor.fetchone()[0]
+        self.assertEqual(count, 1)
 
     def test_get_all_entries_empty(self):
         """Test getting entries from an empty database."""
@@ -152,6 +191,8 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(entries[0].text, "Text 2")
         self.assertEqual(entries[0].app, "App2")
         self.assertEqual(entries[0].title, "Title2")
+        self.assertEqual(entries[0].monitor_id, 1)
+        self.assertEqual(entries[0].image_filename, f"{ts2}_m1.webp")
         np.testing.assert_array_almost_equal(entries[0].embedding, emb2)
         self.assertIsInstance(entries[0].id, int)
 
@@ -183,6 +224,78 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(len(timestamps), 3)
         # Timestamps should be ordered DESC
         self.assertEqual(timestamps, [ts2, ts1, ts3])
+
+    def test_get_timeline_entries(self):
+        """Test timeline entries include monitor id and image filename."""
+        ts = int(time.time())
+        emb = np.array([0.5] * 5, dtype=np.float32)
+
+        insert_entry("M1", ts, emb, "App", "Title", monitor_id=1, image_filename=f"{ts}_m1.webp")
+        insert_entry("M2", ts, emb, "App", "Title", monitor_id=2, image_filename=f"{ts}_m2.webp")
+
+        timeline_entries = get_timeline_entries()
+        self.assertEqual(len(timeline_entries), 2)
+        self.assertEqual(timeline_entries[0].timestamp, ts)
+        self.assertEqual(timeline_entries[0].monitor_id, 1)
+        self.assertEqual(timeline_entries[0].image_filename, f"{ts}_m1.webp")
+        self.assertEqual(timeline_entries[1].monitor_id, 2)
+
+    def test_migrate_legacy_timestamp_unique_schema(self):
+        """Test migration from legacy timestamp-unique schema preserves data."""
+        cursor = self.conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS entries")
+        cursor.execute(
+            """
+            CREATE TABLE entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app TEXT,
+                title TEXT,
+                text TEXT,
+                timestamp INTEGER UNIQUE,
+                embedding BLOB
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON entries (timestamp)")
+
+        ts = int(time.time())
+        emb = np.array([0.7, 0.8, 0.9], dtype=np.float32)
+        cursor.execute(
+            "INSERT INTO entries (app, title, text, timestamp, embedding) VALUES (?, ?, ?, ?, ?)",
+            ("LegacyApp", "LegacyTitle", "Legacy text", ts, emb.tobytes()),
+        )
+        self.conn.commit()
+
+        # Trigger schema migration.
+        create_db()
+
+        cursor.execute("PRAGMA table_info(entries)")
+        columns = [row[1] for row in cursor.fetchall()]
+        self.assertIn("monitor_id", columns)
+        self.assertIn("image_filename", columns)
+
+        # Legacy row should be preserved with default monitor/file metadata.
+        cursor.execute(
+            "SELECT monitor_id, image_filename, text FROM entries WHERE timestamp = ?",
+            (ts,),
+        )
+        row = cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], f"{ts}.webp")
+        self.assertEqual(row[2], "Legacy text")
+
+        # After migration, same timestamp for a second monitor should be allowed.
+        inserted_id = insert_entry(
+            "Second monitor",
+            ts,
+            emb,
+            "App2",
+            "Title2",
+            monitor_id=2,
+            image_filename=f"{ts}_m2.webp",
+        )
+        self.assertIsNotNone(inserted_id)
 
 
 if __name__ == '__main__':
