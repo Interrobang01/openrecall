@@ -37,6 +37,18 @@ app.jinja_env.globals["storage_media_path"] = media_path
 frame_cache_path = os.path.join(media_path, "frame_cache")
 os.makedirs(frame_cache_path, exist_ok=True)
 
+
+def _json_safe(value):
+  if isinstance(value, dict):
+    return {key: _json_safe(item) for key, item in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [_json_safe(item) for item in value]
+  if isinstance(value, np.generic):
+    return value.item()
+  if isinstance(value, np.ndarray):
+    return value.tolist()
+  return value
+
 base_template = """
 <!DOCTYPE html>
 <html lang="en">
@@ -704,28 +716,44 @@ def api_stats():
     thumbnail_size = sum(os.path.getsize(path) for path in thumbnail_files)
     timestamps = get_timestamps()
     return jsonify(
+      _json_safe(
         {
-            "db_size_bytes": db_size,
-            "segment_size_bytes": segment_size,
-            "thumbnail_size_bytes": thumbnail_size,
-            "entry_count": len(timestamps),
-            "segment_count": len(av1_segment_files),
-            "thumbnail_count": len(thumbnail_files),
-            "oldest_timestamp": timestamps[-1] if timestamps else None,
-            "newest_timestamp": timestamps[0] if timestamps else None,
+          "db_size_bytes": db_size,
+          "segment_size_bytes": segment_size,
+          "thumbnail_size_bytes": thumbnail_size,
+          "entry_count": len(timestamps),
+          "segment_count": len(av1_segment_files),
+          "thumbnail_count": len(thumbnail_files),
+          "oldest_timestamp": timestamps[-1] if timestamps else None,
+          "newest_timestamp": timestamps[0] if timestamps else None,
         }
+      )
     )
 
 
 @app.route("/api/status")
 def api_status():
     """Returns live capture loop state as JSON."""
-    return jsonify({
-        "last_capture_ts": capture_state["last_capture_ts"],
-        "captures_this_session": capture_state["captures_this_session"],
-        "last_mssim": capture_state["last_mssim"],
-        "recent_timings": list(capture_state["recent_timings"]),
-    })
+    return jsonify(
+        _json_safe(
+            {
+                "last_capture_ts": capture_state["last_capture_ts"],
+                "captures_this_session": capture_state["captures_this_session"],
+                "last_mssim": capture_state["last_mssim"],
+                "recent_timings": list(capture_state["recent_timings"]),
+            }
+        )
+    )
+
+
+@app.route("/api/ocr-ab-compare")
+def api_ocr_ab_compare():
+    """Returns latest OCR A/B text comparison payload."""
+    compare_payload = capture_state.get("last_ocr_ab_compare")
+    if not compare_payload:
+        return jsonify({"error": "No OCR A/B comparison captured yet."}), 404
+
+    return jsonify(_json_safe(compare_payload))
 
 
 @app.route("/open-folder", methods=["POST"])
@@ -792,6 +820,9 @@ def metrics():
           <th>Time</th>
           <th>MSSIM check</th>
           <th>OCR</th>
+          <th>OCR (A/B)</th>
+          <th>Token recall</th>
+          <th>Char similarity</th>
           <th>Embedding</th>
           <th>DB insert</th>
           <th>Total</th>
@@ -799,7 +830,7 @@ def metrics():
         </tr>
       </thead>
       <tbody id="timings-body">
-        <tr><td colspan="7" class="text-muted">Waiting for captures…</td></tr>
+        <tr><td colspan="10" class="text-muted">Waiting for captures…</td></tr>
       </tbody>
     </table>
   </div>
@@ -821,10 +852,16 @@ function loadMetrics() {
     // most recent first
     [...timings].reverse().forEach(t => {
       const tr = document.createElement('tr');
+      const abMs = t.ocr_ab_ms !== undefined ? (t.ocr_ab_ms + ' ms') : '—';
+      const tokenRecall = t.ocr_ab_token_recall !== undefined ? t.ocr_ab_token_recall : '—';
+      const charSimilarity = t.ocr_ab_char_similarity !== undefined ? t.ocr_ab_char_similarity : '—';
       tr.innerHTML =
         '<td>' + new Date(t.timestamp * 1000).toLocaleTimeString() + '</td>' +
         '<td>' + t.mssim_ms + ' ms</td>' +
         '<td>' + t.ocr_ms + ' ms</td>' +
+        '<td>' + abMs + '</td>' +
+        '<td>' + tokenRecall + '</td>' +
+        '<td>' + charSimilarity + '</td>' +
         '<td>' + t.embedding_ms + ' ms</td>' +
         '<td>' + t.db_ms + ' ms</td>' +
         '<td><strong>' + t.total_ms + ' ms</strong></td>' +

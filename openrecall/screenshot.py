@@ -22,7 +22,7 @@ from openrecall.config import (
 )
 from openrecall.database import insert_entry
 from openrecall.nlp import get_embedding
-from openrecall.ocr import extract_text_from_image
+from openrecall.ocr import extract_text_and_diagnostics_from_image
 from openrecall.utils import (
     get_active_app_name,
     get_active_window_title,
@@ -37,6 +37,7 @@ capture_state: Dict[str, Any] = {
     "captures_this_session": 0,
     "last_mssim": None,
     "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
+    "last_ocr_ab_compare": None,
 }
 
 
@@ -483,7 +484,7 @@ def record_screenshots_thread() -> None:
                     _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
                     t_ocr_start = time.perf_counter()
                     ocr_input = _resize_for_ocr(current_screenshot)
-                    text: str = extract_text_from_image(ocr_input)
+                    text, ocr_diagnostics = extract_text_and_diagnostics_from_image(ocr_input)
                     t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
                     _capture_print(
                         f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
@@ -550,11 +551,26 @@ def record_screenshots_thread() -> None:
                         "timestamp": timestamp,
                         "mssim_ms": round(t_mssim_ms, 1),
                         "ocr_ms": round(t_ocr_ms, 1),
+                        "ocr_primary_ms": ocr_diagnostics.get("primary_ms"),
                         "embedding_ms": round(t_embed_ms, 1),
                         "db_ms": round(t_db_ms, 1),
                         "total_ms": round(total_ms, 1),
                         "had_text": bool(text.strip()),
                     }
+                    if ocr_diagnostics.get("ab_enabled"):
+                        timing["ocr_ab_ms"] = ocr_diagnostics.get("ab_ms")
+                        timing["ocr_ab_text_len"] = ocr_diagnostics.get("ab_text_len")
+                        timing["ocr_ab_token_recall"] = ocr_diagnostics.get("token_recall")
+                        timing["ocr_ab_char_similarity"] = ocr_diagnostics.get("char_similarity")
+                        capture_state["last_ocr_ab_compare"] = {
+                            "timestamp": timestamp,
+                            "monitor_id": monitor_id,
+                            "primary_text": text,
+                            "ab_text": ocr_diagnostics.get("ab_text", ""),
+                            "token_recall": ocr_diagnostics.get("token_recall"),
+                            "char_similarity": ocr_diagnostics.get("char_similarity"),
+                        }
+
                     capture_state["recent_timings"].append(timing)
                     capture_state["last_capture_ts"] = timestamp
                     capture_state["captures_this_session"] += 1

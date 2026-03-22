@@ -9,15 +9,13 @@ with io.open("README.md", "r", encoding="utf-8") as f:
 
 install_requires = [
     "Flask==3.1.3",
-    "numpy==1.26.4",
+    "numpy>=1.26,<3",
     "mss==10.1.0",
     "sentence-transformers==5.3.0",
     "transformers==5.3.0",
     "torch==2.10.0",
     "torchvision==0.25.0",
-    "shapely==2.1.2",
-    "h5py==3.16.0",
-    "rapidfuzz==3.14.3",
+    "onnxtr==0.8.1",
     "Pillow==12.1.1",
 ]
 
@@ -26,9 +24,6 @@ extras_require = {
     "windows": ["pywin32", "psutil"],
     "macos": ["pyobjc==10.3"],
     "linux": [],
-    "python-doctr": [
-        "python-doctr==1.0.1"
-    ],
 }
 
 # Determine the current OS
@@ -45,8 +40,6 @@ else:
 # Include the OS-specific dependencies if the current OS is recognized
 if current_os and current_os in extras_require:
     install_requires.extend(extras_require[current_os])
-
-install_requires.extend(extras_require.get("python-doctr", []))
 
 setup(
     name="OpenRecall",
