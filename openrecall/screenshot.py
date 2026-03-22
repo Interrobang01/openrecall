@@ -31,7 +31,8 @@ capture_state: Dict[str, Any] = {
 
 def _capture_print(message: str) -> None:
     """Prints a flushed capture event message for CLI visibility."""
-    print(f"[openrecall.capture] {message}", flush=True)
+    if VERBOSE_CAPTURE_LOGS:
+        print(f"[openrecall.capture] {message}", flush=True)
 
 
 def _get_env_int(name: str, default: int, minimum: int) -> int:
@@ -60,6 +61,22 @@ def _get_env_float(name: str, default: float, minimum: float) -> float:
         return default
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    """Reads a boolean env var with fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Invalid %s value '%s'. Falling back to %s.", name, raw_value, default)
+    return default
+
+
 CAPTURE_INTERVAL_SECONDS: float = _get_env_float(
     "OPENRECALL_CAPTURE_INTERVAL_SECONDS", default=3.0, minimum=1.0
 )
@@ -68,6 +85,9 @@ SIMILARITY_FRAME_WIDTH: int = _get_env_int(
 )
 OCR_MAX_DIMENSION: int = _get_env_int(
     "OPENRECALL_OCR_MAX_DIMENSION", default=0, minimum=0
+)
+VERBOSE_CAPTURE_LOGS: bool = _get_env_bool(
+    "OPENRECALL_VERBOSE_CAPTURE_LOGS", default=False
 )
 
 

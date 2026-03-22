@@ -102,6 +102,7 @@ You can tune performance with environment variables:
 - `OPENRECALL_CAPTURE_INTERVAL_SECONDS` (default `3.0`, min `1.0`)
 - `OPENRECALL_SIMILARITY_FRAME_WIDTH` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_OCR_MAX_DIMENSION` (default `0` = disabled/original full-size behavior; min `0`)
+- `OPENRECALL_VERBOSE_CAPTURE_LOGS` (default `false`; set to `1`/`true` to enable stage/timing CLI prints)
 - `OPENRECALL_EMBEDDING_DEVICE` (override embedding device, e.g. `cpu`)
 - `OPENRECALL_OCR_DEVICE` (override OCR device, e.g. `cpu`)
 
