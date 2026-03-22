@@ -35,10 +35,54 @@ OpenRecall offers several key advantages over closed-source alternatives:
 
 ## Features
 
-- **Time Travel**: Revisit and explore your past digital activities seamlessly across Windows, macOS, or Linux.
-- **Local-First AI**: OpenRecall harnesses the power of local AI processing to keep your data private and secure.
-- **Semantic Search**: Advanced local OCR interprets your history, providing robust semantic search capabilities.
-- **Full Control Over Storage**: Your data is stored locally, giving you complete control over its management and security.
+- **AV1-first storage pipeline**
+  - Stores captures as rolling AV1 segments (`.mkv`) plus aggressively compressed WebP thumbnails.
+  - Tunable quality/performance knobs for AV1 (`CRF`, `preset`, playback FPS, segment rotation).
+  - Startup ffmpeg capability checks (`libsvtav1` + AV1 decoder) with clear failure messages.
+
+- **Timeline and frame recovery UX**
+  - Date-range filtered timeline with monitor-aware grouping and modal expansion.
+  - Thumbnail-first loading with lazy upgrade to full frame extraction.
+  - Robust frame extraction fallback paths and client retries for in-progress segment writes.
+
+- **Semantic and expression search**
+  - Local OCR + local embeddings for private semantic search.
+  - Multiple search metrics: `cosine`, `dot`, `euclidean`, `manhattan`.
+  - Supports quoted exact phrases and embedding expressions like `(queen) - (king) + (woman)`.
+
+- **Capture controls and hotkeys**
+  - Pause for 5m/30m, pause forever, and resume from the web UI.
+  - Optional global hotkeys for pause/resume actions.
+  - Live capture status indicator and recent capture telemetry.
+
+- **Multi-monitor support**
+  - Per-monitor capture entries with timeline rendering across monitors.
+  - Optional single-display mode via `--primary-monitor-only`.
+  - Reverse monitor ordering toggle in timeline views.
+
+- **Runtime configuration and observability**
+  - In-app config editor (`/config`) backed by `openrecall_config.json`.
+  - Metrics dashboard (`/metrics`) and JSON status/storage APIs.
+  - Storage badge, startup recovery badge, and open-storage-folder action from the UI.
+
+- **OCR tuning and A/B diagnostics**
+  - Configurable OCR detector/recognizer architectures and execution providers.
+  - Optional OCR A/B mode with side-by-side text payload and quality overlap metrics.
+  - Device and thread controls for OCR and embeddings.
+
+- **Privacy controls and safety defaults**
+  - Local-only storage with no required cloud component.
+  - Blacklists for sensitive windows/terms with legacy-default migration.
+  - Easy encrypted-volume usage through `--storage-path`.
+
+- **Reliability and recovery**
+  - Startup quarantine for unreadable tail segments with cleanup of related metadata.
+  - CPU-safe fallbacks for unsupported acceleration paths.
+  - Extra diagnostic logging controls for capture-stage timing.
+
+## What's new in this fork
+
+For a commit-by-commit summary of everything added since this fork (including both overhaul commits), see [docs/whats-new-since-fork.md](docs/whats-new-since-fork.md).
 
 <p align="center">
   <img src="images/lisa_rewind.webp" alt="Lisa Rewind" width="400">
@@ -60,6 +104,7 @@ OpenRecall offers several key advantages over closed-source alternatives:
 ## Quick links
 - [Roadmap](https://github.com/orgs/openrecall/projects/2) and you can [vote for your favorite features](https://github.com/openrecall/openrecall/discussions/9#discussion-6775473)
 - [FAQ](https://github.com/openrecall/openrecall/wiki/FAQ)
+- [What changed in this fork](docs/whats-new-since-fork.md)
 
 ## Get Started
 
