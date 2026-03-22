@@ -8,10 +8,19 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from jinja2 import BaseLoader
 
-from openrecall.config import appdata_folder, screenshots_path
+from openrecall.config import (
+  OPENRECALL_FFMPEG_BIN,
+    OPENRECALL_STORAGE_BACKEND,
+    appdata_folder,
+    check_ffmpeg_av1_capabilities,
+    media_path,
+    segments_path,
+    thumbnails_path,
+)
 from openrecall.database import (
     create_db,
     get_all_entries,
+  get_segment_frame_index,
     get_timestamps,
     get_timeline_entries,
 )
@@ -23,7 +32,10 @@ app = Flask(__name__)
 
 app.jinja_env.filters["human_readable_time"] = human_readable_time
 app.jinja_env.filters["timestamp_to_human_readable"] = timestamp_to_human_readable
-app.jinja_env.globals["screenshots_path"] = screenshots_path
+app.jinja_env.globals["storage_media_path"] = media_path
+
+frame_cache_path = os.path.join(media_path, "frame_cache")
+os.makedirs(frame_cache_path, exist_ok=True)
 
 base_template = """
 <!DOCTYPE html>
@@ -105,7 +117,7 @@ base_template = """
 
     <!-- Open folder button -->
     <button class="btn btn-sm btn-outline-secondary" id="open-folder-btn"
-            title="{{ screenshots_path }}">
+          title="{{ storage_media_path }}">
       <i class="bi bi-folder2-open"></i>
     </button>
 
@@ -155,11 +167,12 @@ function loadStats() {
       return (b/1024).toFixed(0) + ' KB';
     }
     const badge = document.getElementById('storage-badge');
-    badge.textContent = fmt(data.screenshots_size_bytes + data.db_size_bytes) +
+    badge.textContent = fmt(data.segment_size_bytes + data.thumbnail_size_bytes + data.db_size_bytes) +
                         ' · ' + data.entry_count + ' entries';
-    badge.title = 'Screenshots: ' + fmt(data.screenshots_size_bytes) +
+    badge.title = 'AV1 segments: ' + fmt(data.segment_size_bytes) +
+                  ' | Thumbnails: ' + fmt(data.thumbnail_size_bytes) +
                   ' | DB: ' + fmt(data.db_size_bytes);
-    if (data.screenshots_size_bytes + data.db_size_bytes > 5368709120) {
+    if (data.segment_size_bytes + data.thumbnail_size_bytes + data.db_size_bytes > 5368709120) {
       badge.classList.remove('badge-light');
       badge.classList.add('badge-warning');
     }
@@ -195,7 +208,9 @@ def timeline():
         {
             "timestamp": entry.timestamp,
             "monitor_id": entry.monitor_id,
-            "image_filename": entry.image_filename,
+            "segment_filename": entry.segment_filename,
+            "segment_pts_ms": entry.segment_pts_ms,
+            "thumb_filename": entry.thumb_filename,
         }
         for entry in get_timeline_entries()
     ]
@@ -261,6 +276,16 @@ const slider       = document.getElementById('discreteSlider');
 const sliderValue  = document.getElementById('sliderValue');
 const img          = document.getElementById('timestampImage');
 const rangeInfo    = document.getElementById('rangeInfo');
+let pendingFullFrameTimer = null;
+let latestFullFrameToken = 0;
+const fullFrameRetryCount = 2;
+const fullFrameRetryDelayMs = 220;
+
+function buildFrameUrl(item) {
+  return '/frame?segment=' + encodeURIComponent(item.segment_filename) +
+         '&pts_ms=' + encodeURIComponent(item.segment_pts_ms) +
+         '&thumb=' + encodeURIComponent(item.thumb_filename);
+}
 
 function applyFilter() {
   const from = dateFrom.value ? new Date(dateFrom.value).getTime() / 1000 : 0;
@@ -282,8 +307,47 @@ function updateDisplay() {
   const idx = filtered.length - 1 - parseInt(slider.value);
   const item = filtered[idx];
   sliderValue.textContent = new Date(item.timestamp * 1000).toLocaleString() + ' · monitor ' + item.monitor_id;
-  img.src = '/static/' + item.image_filename;
+
+  // Thumbnail first for fast scrubbing.
+  img.src = '/static/' + item.thumb_filename;
   img.style.display = '';
+
+  // Then lazily upgrade to full frame extracted from AV1.
+  if (pendingFullFrameTimer) {
+    clearTimeout(pendingFullFrameTimer);
+  }
+  latestFullFrameToken += 1;
+  const frameToken = latestFullFrameToken;
+  pendingFullFrameTimer = setTimeout(function () {
+    const frameUrl = buildFrameUrl(item);
+
+    function tryLoadFullFrame(attempt) {
+      if (frameToken !== latestFullFrameToken) {
+        return;
+      }
+
+      const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
+      const fullFrame = new Image();
+      fullFrame.onload = function () {
+        if (frameToken === latestFullFrameToken) {
+          img.src = trialUrl;
+        }
+      };
+      fullFrame.onerror = function () {
+        if (frameToken !== latestFullFrameToken) {
+          return;
+        }
+        if (attempt < fullFrameRetryCount) {
+          setTimeout(function () {
+            tryLoadFullFrame(attempt + 1);
+          }, fullFrameRetryDelayMs);
+        }
+      };
+      fullFrame.src = trialUrl;
+    }
+
+    tryLoadFullFrame(0);
+  }, 120);
 }
 
 slider.addEventListener('input', updateDisplay);
@@ -319,8 +383,10 @@ def search():
     results = [
         {
             "timestamp": entries[i].timestamp,
-        "monitor_id": entries[i].monitor_id,
-        "image_filename": entries[i].image_filename or f"{entries[i].timestamp}.webp",
+            "monitor_id": entries[i].monitor_id,
+            "segment_filename": entries[i].segment_filename,
+            "segment_pts_ms": entries[i].segment_pts_ms,
+            "thumb_filename": entries[i].thumb_filename,
             "app": entries[i].app or "",
             "title": entries[i].title or "",
             "text": entries[i].text or "",
@@ -347,7 +413,7 @@ def search():
       <div class="card h-100 shadow-sm">
         <a href="#" data-toggle="modal" data-target="#modal-{{ loop.index0 }}" class="d-block overflow-hidden"
            style="max-height:160px;">
-          <img src="/static/{{ r.image_filename }}" alt="screenshot" class="card-img-top"
+          <img src="/static/{{ r.thumb_filename }}" alt="thumbnail" class="card-img-top"
                style="object-fit:cover; height:160px;">
         </a>
         <div class="card-body p-2">
@@ -380,7 +446,10 @@ def search():
             <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
           </div>
           <div class="modal-body p-0" style="background:#000;">
-            <img src="/static/{{ r.image_filename }}" alt="screenshot"
+            <img src="/static/{{ r.thumb_filename }}" alt="thumbnail"
+               data-segment="{{ r.segment_filename }}"
+               data-pts-ms="{{ r.segment_pts_ms }}"
+              data-thumb="{{ r.thumb_filename }}"
                  style="width:100%; max-height:80vh; object-fit:contain; display:block;">
           </div>
           {% if r.text %}
@@ -396,6 +465,74 @@ def search():
   </div>
   {% endif %}
 </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const fullFrameRetryCount = 2;
+  const fullFrameRetryDelayMs = 220;
+
+  function upgradeModalImage(modalElement) {
+    const image = modalElement.querySelector('img[data-segment]');
+    if (!image || image.dataset.fullLoaded === '1' || image.dataset.fullLoading === '1') {
+      return;
+    }
+    image.dataset.fullLoading = '1';
+
+    const segment = image.dataset.segment;
+    const ptsMs = image.dataset.ptsMs || '0';
+    const thumb = image.dataset.thumb || '';
+    const frameUrl = '/frame?segment=' + encodeURIComponent(segment) +
+             '&pts_ms=' + encodeURIComponent(ptsMs) +
+             '&thumb=' + encodeURIComponent(thumb);
+
+    function tryLoadFullFrame(attempt) {
+      const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
+      const fullFrame = new Image();
+      fullFrame.onload = function() {
+        image.src = trialUrl;
+        image.dataset.fullLoaded = '1';
+        image.dataset.fullLoading = '0';
+      };
+      fullFrame.onerror = function() {
+        if (attempt < fullFrameRetryCount) {
+          setTimeout(function() {
+            tryLoadFullFrame(attempt + 1);
+          }, fullFrameRetryDelayMs);
+          return;
+        }
+        image.dataset.fullLoading = '0';
+      };
+      fullFrame.src = trialUrl;
+    }
+
+    tryLoadFullFrame(0);
+  }
+
+  if (window.jQuery) {
+    window.jQuery('.modal').on('shown.bs.modal', function() {
+      upgradeModalImage(this);
+    });
+  }
+
+  document.querySelectorAll('[data-toggle="modal"][data-target]').forEach(function(trigger) {
+    trigger.addEventListener('click', function() {
+      const targetSelector = trigger.getAttribute('data-target');
+      if (!targetSelector) {
+        return;
+      }
+
+      const modalElement = document.querySelector(targetSelector);
+      if (!modalElement) {
+        return;
+      }
+
+      setTimeout(function() {
+        upgradeModalImage(modalElement);
+      }, 150);
+    });
+  });
+});
+</script>
 {% endblock %}
 """,
         results=results,
@@ -404,7 +541,155 @@ def search():
 
 @app.route("/static/<filename>")
 def serve_image(filename):
-    return send_from_directory(screenshots_path, filename)
+    return send_from_directory(thumbnails_path, filename)
+
+
+@app.route("/frame")
+def serve_frame():
+    """Extracts and serves a full-size frame from an AV1 segment."""
+    segment_name = (request.args.get("segment") or "").strip()
+    pts_ms = request.args.get("pts_ms", type=int)
+    thumb_name = (request.args.get("thumb") or "").strip()
+
+    if not segment_name or pts_ms is None:
+        return jsonify({"error": "Missing required query params: segment and pts_ms"}), 400
+
+    safe_segment_name = os.path.basename(segment_name)
+    if safe_segment_name != segment_name or not safe_segment_name.endswith(".mkv"):
+        return jsonify({"error": "Invalid segment filename"}), 400
+
+    safe_pts_ms = max(0, pts_ms)
+    segment_filepath = os.path.join(segments_path, safe_segment_name)
+    if not os.path.exists(segment_filepath):
+        return jsonify({"error": "Segment not found"}), 404
+
+    safe_thumb_name = ""
+    if thumb_name:
+        candidate_thumb = os.path.basename(thumb_name)
+        if candidate_thumb == thumb_name and candidate_thumb.endswith((".webp", ".jpg", ".jpeg")):
+            safe_thumb_name = candidate_thumb
+
+    frame_index = None
+    if safe_thumb_name:
+        frame_index = get_segment_frame_index(safe_segment_name, safe_thumb_name)
+
+    if frame_index is not None:
+        frame_cache_filename = f"{os.path.splitext(safe_segment_name)[0]}_n{frame_index}.png"
+    else:
+        frame_cache_filename = f"{os.path.splitext(safe_segment_name)[0]}_{safe_pts_ms}.png"
+    frame_cache_filepath = os.path.join(frame_cache_path, frame_cache_filename)
+
+    if not os.path.exists(frame_cache_filepath):
+        temp_filepath = (
+            f"{os.path.splitext(frame_cache_filepath)[0]}"
+            f".tmp-{os.getpid()}.png"
+        )
+        pts_seconds = safe_pts_ms / 1000.0
+        ffmpeg_attempts = []
+        if frame_index is not None:
+            ffmpeg_attempts.append(
+                [
+                    OPENRECALL_FFMPEG_BIN,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    segment_filepath,
+                    "-vf",
+                    f"select=eq(n\\,{frame_index})",
+                    "-vsync",
+                    "vfr",
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-f",
+                    "image2",
+                    temp_filepath,
+                ]
+            )
+
+        ffmpeg_attempts.extend(
+            [
+                [
+                    OPENRECALL_FFMPEG_BIN,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    segment_filepath,
+                    "-ss",
+                    f"{pts_seconds:.3f}",
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-f",
+                    "image2",
+                    temp_filepath,
+                ],
+                [
+                    OPENRECALL_FFMPEG_BIN,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{pts_seconds:.3f}",
+                    "-i",
+                    segment_filepath,
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-f",
+                    "image2",
+                    temp_filepath,
+                ],
+                [
+                    OPENRECALL_FFMPEG_BIN,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-sseof",
+                    "-0.001",
+                    "-i",
+                    segment_filepath,
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-f",
+                    "image2",
+                    temp_filepath,
+                ],
+            ]
+        )
+
+        last_error = ""
+        extracted = False
+        for ffmpeg_command in ffmpeg_attempts:
+            try:
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                subprocess.run(
+                    ffmpeg_command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if os.path.exists(temp_filepath) and os.path.getsize(temp_filepath) > 0:
+                    os.replace(temp_filepath, frame_cache_filepath)
+                    extracted = True
+                    break
+            except subprocess.CalledProcessError as exc:
+                last_error = (exc.stderr or "").strip()
+
+        if not extracted:
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            return jsonify({"error": f"Failed to decode frame: {last_error or 'unknown error'}"}), 500
+
+    return send_from_directory(frame_cache_path, frame_cache_filename)
 
 
 @app.route("/api/stats")
@@ -412,17 +697,24 @@ def api_stats():
     """Returns storage and database statistics as JSON."""
     db_path = os.path.join(appdata_folder, "recall.db")
     db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
-    webp_files = glob.glob(os.path.join(screenshots_path, "*.webp"))
-    screenshots_size = sum(os.path.getsize(f) for f in webp_files)
+    av1_segment_files = glob.glob(os.path.join(segments_path, "*.mkv"))
+    thumbnail_files = glob.glob(os.path.join(thumbnails_path, "*.webp"))
+    thumbnail_files.extend(glob.glob(os.path.join(thumbnails_path, "*.jpg")))
+    segment_size = sum(os.path.getsize(path) for path in av1_segment_files)
+    thumbnail_size = sum(os.path.getsize(path) for path in thumbnail_files)
     timestamps = get_timestamps()
-    return jsonify({
-        "db_size_bytes": db_size,
-        "screenshots_size_bytes": screenshots_size,
-        "entry_count": len(timestamps),
-        "screenshot_count": len(webp_files),
-        "oldest_timestamp": timestamps[-1] if timestamps else None,
-        "newest_timestamp": timestamps[0] if timestamps else None,
-    })
+    return jsonify(
+        {
+            "db_size_bytes": db_size,
+            "segment_size_bytes": segment_size,
+            "thumbnail_size_bytes": thumbnail_size,
+            "entry_count": len(timestamps),
+            "segment_count": len(av1_segment_files),
+            "thumbnail_count": len(thumbnail_files),
+            "oldest_timestamp": timestamps[-1] if timestamps else None,
+            "newest_timestamp": timestamps[0] if timestamps else None,
+        }
+    )
 
 
 @app.route("/api/status")
@@ -438,14 +730,14 @@ def api_status():
 
 @app.route("/open-folder", methods=["POST"])
 def open_folder():
-    """Opens the screenshots folder in the system file manager."""
+    """Opens the storage folder in the system file manager."""
     try:
         if sys.platform == "win32":
-            subprocess.Popen(["explorer", screenshots_path])
+            subprocess.Popen(["explorer", media_path])
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", screenshots_path])
+            subprocess.Popen(["open", media_path])
         else:
-            subprocess.Popen(["xdg-open", screenshots_path])
+            subprocess.Popen(["xdg-open", media_path])
         return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)})
@@ -550,6 +842,17 @@ setInterval(loadMetrics, 5000);
 
 
 if __name__ == "__main__":
+    try:
+        if OPENRECALL_STORAGE_BACKEND != "av1_hybrid":
+            raise RuntimeError(
+                "Only OPENRECALL_STORAGE_BACKEND=av1_hybrid is supported. "
+                f"Current value: {OPENRECALL_STORAGE_BACKEND!r}"
+            )
+        check_ffmpeg_av1_capabilities()
+    except RuntimeError as exc:
+        print(f"Startup capability check failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     create_db()
 
     print(f"Appdata folder: {appdata_folder}")

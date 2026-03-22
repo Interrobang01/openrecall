@@ -1,14 +1,25 @@
 import collections
 import logging
 import os
+import subprocess
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mss
 import numpy as np
 from PIL import Image
 
-from openrecall.config import screenshots_path, args
+from openrecall.config import (
+    OPENRECALL_AV1_CRF,
+    OPENRECALL_AV1_PRESET,
+    OPENRECALL_AV1_SEGMENT_SECONDS,
+    OPENRECALL_FFMPEG_BIN,
+    OPENRECALL_THUMB_MAX_DIMENSION,
+    OPENRECALL_THUMB_QUALITY,
+    args,
+    segments_path,
+    thumbnails_path,
+)
 from openrecall.database import insert_entry
 from openrecall.nlp import get_embedding
 from openrecall.ocr import extract_text_from_image
@@ -89,6 +100,183 @@ OCR_MAX_DIMENSION: int = _get_env_int(
 VERBOSE_CAPTURE_LOGS: bool = _get_env_bool(
     "OPENRECALL_VERBOSE_CAPTURE_LOGS", default=False
 )
+
+THUMB_MAX_DIMENSION = OPENRECALL_THUMB_MAX_DIMENSION
+
+
+class MonitorAv1SegmentWriter:
+    """Writes monitor frames into rolling AV1 segments via ffmpeg."""
+
+    def __init__(self, monitor_id: int) -> None:
+        self.monitor_id = monitor_id
+        self.segment_filename: Optional[str] = None
+        self.segment_started_at_ms: Optional[int] = None
+        self._width: Optional[int] = None
+        self._height: Optional[int] = None
+        self._process: Optional[subprocess.Popen] = None
+        self._segment_frame_index: int = 0
+
+    def _is_expired(self, timestamp_ms: int) -> bool:
+        if self.segment_started_at_ms is None:
+            return True
+        return (timestamp_ms - self.segment_started_at_ms) >= int(
+            OPENRECALL_AV1_SEGMENT_SECONDS * 1000
+        )
+
+    def close(self) -> None:
+        """Closes the active ffmpeg segment process if present."""
+        if self._process is None:
+            return
+
+        process = self._process
+        self._process = None
+
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            finally:
+                process.stdin = None
+
+        stderr_bytes = b""
+        try:
+            _, stderr_bytes = process.communicate(timeout=30)
+        except ValueError:
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=30)
+
+            if process.stderr is not None:
+                stderr_bytes = process.stderr.read() or b""
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr_bytes = process.communicate()
+
+        if process.returncode not in (0, None):
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                "ffmpeg AV1 writer exited with "
+                f"code {process.returncode} for monitor {self.monitor_id}: {stderr_text}"
+            )
+
+    def _start(self, width: int, height: int, timestamp_ms: int) -> None:
+        self.segment_started_at_ms = timestamp_ms
+        self.segment_filename = f"{timestamp_ms}_m{self.monitor_id}.mkv"
+        self._width = width
+        self._height = height
+        self._segment_frame_index = 0
+
+        segment_filepath = os.path.join(segments_path, self.segment_filename)
+        fps = 1.0 / CAPTURE_INTERVAL_SECONDS
+
+        ffmpeg_command = [
+            OPENRECALL_FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            f"{fps:.6f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libsvtav1",
+            "-crf",
+            str(OPENRECALL_AV1_CRF),
+            "-preset",
+            OPENRECALL_AV1_PRESET,
+            segment_filepath,
+        ]
+
+        self._process = subprocess.Popen(
+            ffmpeg_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if self._process.stdin is None:
+            raise RuntimeError(
+                f"Failed to start ffmpeg AV1 writer for monitor {self.monitor_id}."
+            )
+
+    def write_frame(self, frame: np.ndarray, timestamp_ms: int) -> Tuple[str, int]:
+        """Writes a frame and returns (segment_filename, segment_pts_ms)."""
+        height, width = frame.shape[:2]
+        should_rotate = (
+            self._process is None
+            or self._width != width
+            or self._height != height
+            or self._is_expired(timestamp_ms)
+        )
+
+        if should_rotate:
+            self.close()
+            self._start(width, height, timestamp_ms)
+
+        if (
+            self._process is None
+            or self._process.stdin is None
+            or self.segment_filename is None
+            or self.segment_started_at_ms is None
+        ):
+            raise RuntimeError(
+                f"AV1 writer process is not available for monitor {self.monitor_id}."
+            )
+
+        frame_bytes = np.ascontiguousarray(frame, dtype=np.uint8).tobytes()
+        try:
+            self._process.stdin.write(frame_bytes)
+        except (BrokenPipeError, OSError) as exc:
+            stderr_text = ""
+            if self._process.stderr is not None:
+                stderr_text = self._process.stderr.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            raise RuntimeError(
+                f"ffmpeg AV1 writer failed for monitor {self.monitor_id}: {stderr_text}"
+            ) from exc
+
+        segment_pts_ms = int(round(self._segment_frame_index * CAPTURE_INTERVAL_SECONDS * 1000.0))
+        self._segment_frame_index += 1
+        return self.segment_filename, segment_pts_ms
+
+
+def _save_thumbnail(image: np.ndarray, capture_id_ms: int, monitor_id: int) -> str:
+    """Creates and stores a compressed lossy WebP thumbnail for a capture."""
+    thumb_image = Image.fromarray(image)
+    width, height = thumb_image.size
+    longest_side = max(width, height)
+
+    if longest_side > THUMB_MAX_DIMENSION:
+        scale = THUMB_MAX_DIMENSION / float(longest_side)
+        resized_width = max(1, int(width * scale))
+        resized_height = max(1, int(height * scale))
+        thumb_image = thumb_image.resize(
+            (resized_width, resized_height),
+            Image.Resampling.LANCZOS,
+        )
+
+    thumb_filename = f"{capture_id_ms}_m{monitor_id}.webp"
+    thumb_filepath = os.path.join(thumbnails_path, thumb_filename)
+    thumb_image.save(
+        thumb_filepath,
+        format="WEBP",
+        quality=OPENRECALL_THUMB_QUALITY,
+        method=6,
+        lossless=False,
+    )
+    return thumb_filename
 
 
 def _resize_for_ocr(image: np.ndarray, max_dimension: int = OCR_MAX_DIMENSION) -> np.ndarray:
@@ -234,126 +422,155 @@ def record_screenshots_thread() -> None:
         monitor_id: _prepare_similarity_frame(screenshot)
         for monitor_id, screenshot in initial_screenshots
     }
+    segment_writers: Dict[int, MonitorAv1SegmentWriter] = {}
     _capture_print(f"screenshots_taken monitors={len(last_similarity_frames)}")
 
-    while True:
-        if not is_user_active():
-            time.sleep(CAPTURE_INTERVAL_SECONDS)
-            continue
+    try:
+        while True:
+            if not is_user_active():
+                time.sleep(CAPTURE_INTERVAL_SECONDS)
+                continue
 
-        current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
-        _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
+            current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
+            _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
 
-        current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
+            current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
 
-        # Ensure we have a last frame for each current screenshot.
-        # This handles cases where monitor setup might change (though unlikely mid-run)
-        if set(last_similarity_frames.keys()) != current_monitor_ids:
-            # If monitor count changes, reset and continue.
-            _capture_print(
-                "monitor_layout_changed "
-                f"previous={len(last_similarity_frames)} current={len(current_screenshots)}"
-            )
-            last_similarity_frames = {
-                monitor_id: _prepare_similarity_frame(screenshot)
-                for monitor_id, screenshot in current_screenshots
-            }
-            time.sleep(CAPTURE_INTERVAL_SECONDS)
-            continue
+            removed_monitors = set(segment_writers.keys()) - current_monitor_ids
+            for removed_monitor_id in removed_monitors:
+                try:
+                    segment_writers[removed_monitor_id].close()
+                except RuntimeError as exc:
+                    logger.warning("Failed closing AV1 writer for monitor %s: %s", removed_monitor_id, exc)
+                del segment_writers[removed_monitor_id]
 
-        for monitor_id, current_screenshot in current_screenshots:
-            t_frame_start = time.perf_counter()
-            current_similarity_frame = _prepare_similarity_frame(current_screenshot)
-            last_similarity_frame = last_similarity_frames[monitor_id]
-
-            mssim_val = mean_structured_similarity_index(current_similarity_frame, last_similarity_frame)
-            t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
-            capture_state["last_mssim"] = round(mssim_val, 4)
-            _capture_print(
-                f"similarity_checked monitor={monitor_id} mssim={mssim_val:.4f} "
-                f"mssim_ms={t_mssim_ms:.1f}"
-            )
-
-            if mssim_val < 0.9:
-                last_similarity_frames[monitor_id] = current_similarity_frame
-                image = Image.fromarray(current_screenshot)
-                timestamp = int(time.time())
-                filename = f"{timestamp}_m{monitor_id}.webp"
-                filepath = os.path.join(screenshots_path, filename)
+            # Ensure we have a last frame for each current screenshot.
+            # This handles cases where monitor setup might change (though unlikely mid-run)
+            if set(last_similarity_frames.keys()) != current_monitor_ids:
+                # If monitor count changes, reset and continue.
                 _capture_print(
-                    f"capture_changed monitor={monitor_id} timestamp={timestamp} file={filepath}"
+                    "monitor_layout_changed "
+                    f"previous={len(last_similarity_frames)} current={len(current_screenshots)}"
                 )
-                image.save(
-                    filepath,
-                    format="webp",
-                    lossless=True,
-                )
-
-                _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
-                t_ocr_start = time.perf_counter()
-                ocr_input = _resize_for_ocr(current_screenshot)
-                text: str = extract_text_from_image(ocr_input)
-                t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
-                _capture_print(
-                    f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
-                    f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
-                )
-
-                t_embed_ms = 0.0
-                t_db_ms = 0.0
-                if text.strip():
-                    _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
-                    t_embed_start = time.perf_counter()
-                    embedding: np.ndarray = get_embedding(text)
-                    t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
-                    _capture_print(
-                        f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
-                        f"embedding_ms={t_embed_ms:.1f}"
-                    )
-
-                    active_app_name: str = get_active_app_name() or "Unknown App"
-                    active_window_title: str = get_active_window_title() or "Unknown Title"
-
-                    _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
-                    t_db_start = time.perf_counter()
-                    insert_entry(
-                        text,
-                        timestamp,
-                        embedding,
-                        active_app_name,
-                        active_window_title,
-                        monitor_id=monitor_id,
-                        image_filename=filename,
-                    )
-                    t_db_ms = (time.perf_counter() - t_db_start) * 1000
-                    _capture_print(
-                        f"db_write_stop monitor={monitor_id} timestamp={timestamp} db_ms={t_db_ms:.1f}"
-                    )
-                else:
-                    _capture_print(
-                        f"embedding_skipped monitor={monitor_id} timestamp={timestamp} reason=no_text"
-                    )
-
-                total_ms = (time.perf_counter() - t_frame_start) * 1000
-                timing = {
-                    "timestamp": timestamp,
-                    "mssim_ms": round(t_mssim_ms, 1),
-                    "ocr_ms": round(t_ocr_ms, 1),
-                    "embedding_ms": round(t_embed_ms, 1),
-                    "db_ms": round(t_db_ms, 1),
-                    "total_ms": round(total_ms, 1),
-                    "had_text": bool(text.strip()),
+                last_similarity_frames = {
+                    monitor_id: _prepare_similarity_frame(screenshot)
+                    for monitor_id, screenshot in current_screenshots
                 }
-                capture_state["recent_timings"].append(timing)
-                capture_state["last_capture_ts"] = timestamp
-                capture_state["captures_this_session"] += 1
+                time.sleep(CAPTURE_INTERVAL_SECONDS)
+                continue
+
+            for monitor_id, current_screenshot in current_screenshots:
+                t_frame_start = time.perf_counter()
+                current_similarity_frame = _prepare_similarity_frame(current_screenshot)
+                last_similarity_frame = last_similarity_frames[monitor_id]
+
+                mssim_val = mean_structured_similarity_index(
+                    current_similarity_frame,
+                    last_similarity_frame,
+                )
+                t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
+                capture_state["last_mssim"] = round(mssim_val, 4)
                 _capture_print(
-                    "metrics "
-                    f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
-                    f"mssim_ms={timing['mssim_ms']:.1f} ocr_ms={timing['ocr_ms']:.1f} "
-                    f"embedding_ms={timing['embedding_ms']:.1f} db_ms={timing['db_ms']:.1f} "
-                    f"total_ms={timing['total_ms']:.1f} had_text={timing['had_text']} "
-                    f"captures_this_session={capture_state['captures_this_session']}"
+                    f"similarity_checked monitor={monitor_id} mssim={mssim_val:.4f} "
+                    f"mssim_ms={t_mssim_ms:.1f}"
                 )
 
-        time.sleep(CAPTURE_INTERVAL_SECONDS)
+                if mssim_val < 0.9:
+                    last_similarity_frames[monitor_id] = current_similarity_frame
+                    timestamp = int(time.time())
+                    capture_id_ms = int(time.time() * 1000)
+
+                    _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
+                    t_ocr_start = time.perf_counter()
+                    ocr_input = _resize_for_ocr(current_screenshot)
+                    text: str = extract_text_from_image(ocr_input)
+                    t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
+                    _capture_print(
+                        f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
+                        f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
+                    )
+
+                    t_embed_ms = 0.0
+                    t_db_ms = 0.0
+                    if text.strip():
+                        _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
+                        t_embed_start = time.perf_counter()
+                        embedding: np.ndarray = get_embedding(text)
+                        t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
+                        _capture_print(
+                            f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
+                            f"embedding_ms={t_embed_ms:.1f}"
+                        )
+
+                        active_app_name: str = get_active_app_name() or "Unknown App"
+                        active_window_title: str = get_active_window_title() or "Unknown Title"
+
+                        _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
+                        t_db_start = time.perf_counter()
+
+                        writer = segment_writers.setdefault(
+                            monitor_id,
+                            MonitorAv1SegmentWriter(monitor_id),
+                        )
+                        segment_filename, segment_pts_ms = writer.write_frame(
+                            current_screenshot,
+                            capture_id_ms,
+                        )
+                        thumb_filename = _save_thumbnail(
+                            current_screenshot,
+                            capture_id_ms,
+                            monitor_id,
+                        )
+
+                        insert_entry(
+                            text,
+                            timestamp,
+                            embedding,
+                            active_app_name,
+                            active_window_title,
+                            monitor_id=monitor_id,
+                            segment_filename=segment_filename,
+                            segment_pts_ms=segment_pts_ms,
+                            thumb_filename=thumb_filename,
+                        )
+                        t_db_ms = (time.perf_counter() - t_db_start) * 1000
+                        _capture_print(
+                            "db_write_stop "
+                            f"monitor={monitor_id} timestamp={timestamp} db_ms={t_db_ms:.1f} "
+                            f"segment={segment_filename} pts_ms={segment_pts_ms} "
+                            f"thumb={thumb_filename}"
+                        )
+                    else:
+                        _capture_print(
+                            f"embedding_skipped monitor={monitor_id} timestamp={timestamp} reason=no_text"
+                        )
+
+                    total_ms = (time.perf_counter() - t_frame_start) * 1000
+                    timing = {
+                        "timestamp": timestamp,
+                        "mssim_ms": round(t_mssim_ms, 1),
+                        "ocr_ms": round(t_ocr_ms, 1),
+                        "embedding_ms": round(t_embed_ms, 1),
+                        "db_ms": round(t_db_ms, 1),
+                        "total_ms": round(total_ms, 1),
+                        "had_text": bool(text.strip()),
+                    }
+                    capture_state["recent_timings"].append(timing)
+                    capture_state["last_capture_ts"] = timestamp
+                    capture_state["captures_this_session"] += 1
+                    _capture_print(
+                        "metrics "
+                        f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
+                        f"mssim_ms={timing['mssim_ms']:.1f} ocr_ms={timing['ocr_ms']:.1f} "
+                        f"embedding_ms={timing['embedding_ms']:.1f} db_ms={timing['db_ms']:.1f} "
+                        f"total_ms={timing['total_ms']:.1f} had_text={timing['had_text']} "
+                        f"captures_this_session={capture_state['captures_this_session']}"
+                    )
+
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
+    finally:
+        for monitor_id, writer in segment_writers.items():
+            try:
+                writer.close()
+            except RuntimeError as exc:
+                logger.warning("Failed closing AV1 writer for monitor %s: %s", monitor_id, exc)

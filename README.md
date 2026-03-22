@@ -16,7 +16,7 @@ OpenRecall is a fully open-source, privacy-first alternative to proprietary solu
 
 ## What does it do?
 
-OpenRecall captures your digital history through regularly taken snapshots, which are essentially screenshots. The text and images within these screenshots are analyzed and made searchable, allowing you to quickly find specific information by typing relevant keywords into OpenRecall. You can also manually scroll back through your history to revisit past activities.
+OpenRecall captures your digital history through regularly taken snapshots. Captures are stored as AV1 video segments with aggressively compressed WebP thumbnails, then analyzed with OCR and made searchable so you can quickly find specific information by typing relevant keywords into OpenRecall. You can also manually scroll back through your history to revisit past activities.
 
 https://github.com/openrecall/openrecall/assets/16676419/cfc579cb-165b-43e4-9325-9160da6487d2
 
@@ -83,7 +83,7 @@ Open your browser to:
 [http://localhost:8082](http://localhost:8082) to access OpenRecall.
 
 ## Arguments
-`--storage-path` (default: user data path for your OS): allows you to specify the path where the screenshots and database should be stored. We recommend [creating an encrypted volume](docs/encryption.md) to store your data.
+`--storage-path` (default: user data path for your OS): allows you to specify the path where the media (`media/segments`, `media/thumbnails`) and database should be stored. We recommend [creating an encrypted volume](docs/encryption.md) to store your data.
 
 `--primary-monitor-only` (default: False): only record the primary monitor (rather than individual screenshots for other monitors)
 
@@ -105,6 +105,22 @@ You can tune performance with environment variables:
 - `OPENRECALL_VERBOSE_CAPTURE_LOGS` (default `false`; set to `1`/`true` to enable stage/timing CLI prints)
 - `OPENRECALL_EMBEDDING_DEVICE` (override embedding device, e.g. `cpu`)
 - `OPENRECALL_OCR_DEVICE` (override OCR device, e.g. `cpu`)
+- `OPENRECALL_STORAGE_BACKEND` (must be `av1_hybrid`)
+- `OPENRECALL_FFMPEG_BIN` (default `ffmpeg`)
+- `OPENRECALL_AV1_CRF` (default `38`, lower = larger files / higher quality)
+- `OPENRECALL_AV1_PRESET` (default `8`, lower = slower encode / better compression)
+- `OPENRECALL_AV1_SEGMENT_SECONDS` (default `120`, min `1.0`)
+- `OPENRECALL_THUMB_QUALITY` (default `8`, range `1..100`)
+- `OPENRECALL_THUMB_MAX_DIMENSION` (default `320`, range `64..4096`)
+
+### AV1 backend requirements
+
+OpenRecall now requires an ffmpeg build with:
+
+- `libsvtav1` encoder
+- and at least one AV1 decoder: `libdav1d` or `libaom-av1`
+
+On startup, OpenRecall checks ffmpeg capabilities and exits with a clear error if requirements are missing.
 
 Examples:
 

@@ -1,7 +1,7 @@
 import sqlite3
 from collections import namedtuple
 import numpy as np
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 from openrecall.config import db_path
 
@@ -15,11 +15,35 @@ Entry = namedtuple(
         "text",
         "timestamp",
         "monitor_id",
-        "image_filename",
+        "segment_filename",
+        "segment_pts_ms",
+        "thumb_filename",
         "embedding",
     ],
 )
-TimelineEntry = namedtuple("TimelineEntry", ["timestamp", "monitor_id", "image_filename"])
+TimelineEntry = namedtuple(
+    "TimelineEntry",
+    [
+        "timestamp",
+        "monitor_id",
+        "segment_filename",
+        "segment_pts_ms",
+        "thumb_filename",
+    ],
+)
+
+EXPECTED_SCHEMA_COLUMNS = [
+    "id",
+    "app",
+    "title",
+    "text",
+    "timestamp",
+    "monitor_id",
+    "segment_filename",
+    "segment_pts_ms",
+    "thumb_filename",
+    "embedding",
+]
 
 
 def _entries_table_exists(cursor: sqlite3.Cursor) -> bool:
@@ -36,123 +60,57 @@ def _get_entries_columns(cursor: sqlite3.Cursor) -> List[str]:
     return [row[1] for row in cursor.fetchall()]
 
 
-def _has_unique_timestamp_constraint(cursor: sqlite3.Cursor) -> bool:
-    """Checks if entries has a unique index/constraint on timestamp alone."""
-    cursor.execute("PRAGMA index_list(entries)")
-    index_rows = cursor.fetchall()
-    for index_row in index_rows:
-        index_name = index_row[1]
-        is_unique = bool(index_row[2])
-        if not is_unique:
-            continue
-
-        safe_index_name = index_name.replace('"', '""')
-        cursor.execute(f'PRAGMA index_info("{safe_index_name}")')
-        indexed_columns = [idx_row[2] for idx_row in cursor.fetchall()]
-        if indexed_columns == ["timestamp"]:
-            return True
-    return False
-
-
 def _create_entries_table(cursor: sqlite3.Cursor, table_name: str = "entries") -> None:
-    """Creates entries table using the latest schema."""
+    """Creates entries table using the AV1-first schema."""
     cursor.execute(
         f"""CREATE TABLE IF NOT EXISTS {table_name} (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                app TEXT,
                title TEXT,
                text TEXT,
-               timestamp INTEGER,
-               monitor_id INTEGER NOT NULL DEFAULT 1,
-               image_filename TEXT NOT NULL UNIQUE,
+               timestamp INTEGER NOT NULL,
+               monitor_id INTEGER NOT NULL,
+               segment_filename TEXT NOT NULL,
+               segment_pts_ms INTEGER NOT NULL,
+               thumb_filename TEXT NOT NULL,
                embedding BLOB
            )"""
     )
 
 
-def _rebuild_entries_table(
-    cursor: sqlite3.Cursor,
-    has_monitor_id: bool,
-    has_image_filename: bool,
-) -> None:
-    """Rebuilds entries table to drop legacy constraints and apply latest schema."""
-    _create_entries_table(cursor, table_name="entries_new")
-
-    monitor_expr = "monitor_id" if has_monitor_id else "1"
-    image_expr = "image_filename" if has_image_filename else "CAST(timestamp AS TEXT) || '.webp'"
-    cursor.execute(
-        f"""
-        INSERT OR IGNORE INTO entries_new
-            (id, app, title, text, timestamp, monitor_id, image_filename, embedding)
-        SELECT
-            id,
-            app,
-            title,
-            text,
-            timestamp,
-            COALESCE({monitor_expr}, 1),
-            COALESCE(NULLIF({image_expr}, ''), CAST(timestamp AS TEXT) || '.webp'),
-            embedding
-        FROM entries
-        ORDER BY id
-        """
-    )
-
-    cursor.execute("DROP TABLE entries")
-    cursor.execute("ALTER TABLE entries_new RENAME TO entries")
-
-
 def _ensure_entries_schema(cursor: sqlite3.Cursor) -> None:
-    """Ensures entries table exists with monitor-aware schema and indexes."""
-    if not _entries_table_exists(cursor):
-        _create_entries_table(cursor)
-    else:
-        columns = _get_entries_columns(cursor)
-        has_monitor_id = "monitor_id" in columns
-        has_image_filename = "image_filename" in columns
+    """Ensures a fresh AV1-first schema; drops incompatible legacy tables."""
+    if _entries_table_exists(cursor):
+        existing_columns = _get_entries_columns(cursor)
+        if existing_columns != EXPECTED_SCHEMA_COLUMNS:
+            cursor.execute("DROP TABLE entries")
 
-        if _has_unique_timestamp_constraint(cursor):
-            _rebuild_entries_table(
-                cursor,
-                has_monitor_id=has_monitor_id,
-                has_image_filename=has_image_filename,
-            )
-        else:
-            if not has_monitor_id:
-                cursor.execute(
-                    "ALTER TABLE entries ADD COLUMN monitor_id INTEGER NOT NULL DEFAULT 1"
-                )
-            if not has_image_filename:
-                cursor.execute("ALTER TABLE entries ADD COLUMN image_filename TEXT")
-
-            cursor.execute("UPDATE entries SET monitor_id = COALESCE(monitor_id, 1)")
-            cursor.execute(
-                """
-                UPDATE entries
-                SET image_filename = CAST(timestamp AS TEXT) || '.webp'
-                WHERE image_filename IS NULL OR image_filename = ''
-                """
-            )
-
+    _create_entries_table(cursor)
     cursor.execute(
-        """
-        DELETE FROM entries
-        WHERE id NOT IN (
-            SELECT MAX(id)
-            FROM entries
-            GROUP BY image_filename
-        )
-        """
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_thumb_filename ON entries (thumb_filename)"
     )
-    cursor.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_image_filename ON entries (image_filename)"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_timestamp ON entries (timestamp)"
-    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON entries (timestamp)")
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_timestamp_monitor ON entries (timestamp, monitor_id)"
     )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_segment_lookup ON entries (segment_filename, segment_pts_ms)"
+    )
+
+
+def _should_vacuum(cursor: sqlite3.Cursor, threshold_ratio: float = 0.2) -> bool:
+    """Returns True when SQLite free pages are high enough to justify VACUUM."""
+    cursor.execute("PRAGMA page_count")
+    page_count = int(cursor.fetchone()[0])
+    if page_count <= 0:
+        return False
+
+    cursor.execute("PRAGMA freelist_count")
+    freelist_count = int(cursor.fetchone()[0])
+    if freelist_count <= 0:
+        return False
+
+    return (freelist_count / float(page_count)) >= threshold_ratio
 
 
 def create_db() -> None:
@@ -162,11 +120,17 @@ def create_db() -> None:
     The table schema includes columns for an auto-incrementing ID, application name,
     window title, extracted text, timestamp, and text embedding.
     """
+    should_vacuum = False
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             _ensure_entries_schema(cursor)
             conn.commit()
+            should_vacuum = _should_vacuum(cursor)
+
+        if should_vacuum:
+            with sqlite3.connect(db_path) as vacuum_conn:
+                vacuum_conn.execute("VACUUM")
     except sqlite3.Error as e:
         print(f"Database error during table creation: {e}")
 
@@ -186,7 +150,17 @@ def get_all_entries() -> List[Entry]:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id, app, title, text, timestamp, monitor_id, image_filename, embedding
+                SELECT
+                    id,
+                    app,
+                    title,
+                    text,
+                    timestamp,
+                    monitor_id,
+                    segment_filename,
+                    segment_pts_ms,
+                    thumb_filename,
+                    embedding
                 FROM entries
                 ORDER BY timestamp DESC, monitor_id ASC
                 """
@@ -208,7 +182,9 @@ def get_all_entries() -> List[Entry]:
                         text=row["text"],
                         timestamp=row["timestamp"],
                         monitor_id=row["monitor_id"],
-                        image_filename=row["image_filename"],
+                        segment_filename=row["segment_filename"],
+                        segment_pts_ms=row["segment_pts_ms"],
+                        thumb_filename=row["thumb_filename"],
                         embedding=embedding,
                     )
                 )
@@ -239,7 +215,7 @@ def get_timestamps() -> List[int]:
 
 
 def get_timeline_entries() -> List[TimelineEntry]:
-    """Retrieves timeline entries with monitor identity and image filename."""
+    """Retrieves timeline entries with monitor identity and thumbnail metadata."""
     timeline_entries: List[TimelineEntry] = []
     try:
         with sqlite3.connect(db_path) as conn:
@@ -247,7 +223,7 @@ def get_timeline_entries() -> List[TimelineEntry]:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT timestamp, monitor_id, image_filename
+                SELECT timestamp, monitor_id, segment_filename, segment_pts_ms, thumb_filename
                 FROM entries
                 ORDER BY timestamp DESC, monitor_id ASC
                 """
@@ -258,12 +234,50 @@ def get_timeline_entries() -> List[TimelineEntry]:
                     TimelineEntry(
                         timestamp=row["timestamp"],
                         monitor_id=row["monitor_id"],
-                        image_filename=row["image_filename"],
+                        segment_filename=row["segment_filename"],
+                        segment_pts_ms=row["segment_pts_ms"],
+                        thumb_filename=row["thumb_filename"],
                     )
                 )
     except sqlite3.Error as e:
         print(f"Database error while fetching timeline entries: {e}")
     return timeline_entries
+
+
+def get_segment_frame_index(segment_filename: str, thumb_filename: str) -> Optional[int]:
+    """Returns zero-based frame index within a segment for a thumbnail entry."""
+    frame_index: Optional[int] = None
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id
+                FROM entries
+                WHERE segment_filename = ? AND thumb_filename = ?
+                LIMIT 1
+                """,
+                (segment_filename, thumb_filename),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+
+            entry_id = int(row[0])
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM entries
+                WHERE segment_filename = ? AND id < ?
+                """,
+                (segment_filename, entry_id),
+            )
+            count_row = cursor.fetchone()
+            frame_index = int(count_row[0]) if count_row is not None else None
+    except sqlite3.Error as e:
+        print(f"Database error while resolving segment frame index: {e}")
+
+    return frame_index
 
 
 def insert_entry(
@@ -273,7 +287,9 @@ def insert_entry(
     app: str,
     title: str,
     monitor_id: int = 1,
-    image_filename: Optional[str] = None,
+    segment_filename: Optional[str] = None,
+    segment_pts_ms: int = 0,
+    thumb_filename: Optional[str] = None,
 ) -> Optional[int]:
     """
     Inserts a new entry into the database.
@@ -285,15 +301,20 @@ def insert_entry(
         app (str): The name of the active application.
         title (str): The title of the active window.
         monitor_id (int): The monitor id the screenshot was captured from.
-        image_filename (Optional[str]): The screenshot filename on disk.
+        segment_filename (Optional[str]): The AV1 segment filename on disk.
+        segment_pts_ms (int): Capture offset in milliseconds within the segment.
+        thumb_filename (Optional[str]): The JPEG thumbnail filename on disk.
 
     Returns:
         Optional[int]: The ID of the newly inserted row, or None if insertion fails.
                        Prints an error message to stderr on failure.
     """
-    embedding_bytes: bytes = embedding.astype(np.float32).tobytes() # Ensure consistent dtype
-    if not image_filename:
-        image_filename = f"{timestamp}_m{monitor_id}.webp"
+    if not segment_filename:
+        raise ValueError("segment_filename is required for AV1 storage backend")
+    if not thumb_filename:
+        raise ValueError("thumb_filename is required for AV1 storage backend")
+
+    embedding_bytes: bytes = embedding.astype(np.float32).tobytes()
 
     last_row_id: Optional[int] = None
     try:
@@ -301,28 +322,36 @@ def insert_entry(
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO entries (text, timestamp, monitor_id, image_filename, embedding, app, title)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(image_filename) DO NOTHING
+                INSERT INTO entries (
+                    text,
+                    timestamp,
+                    monitor_id,
+                    segment_filename,
+                    segment_pts_ms,
+                    thumb_filename,
+                    embedding,
+                    app,
+                    title
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thumb_filename) DO NOTHING
                 """,
                 (
                     text,
                     timestamp,
                     monitor_id,
-                    image_filename,
+                    segment_filename,
+                    segment_pts_ms,
+                    thumb_filename,
                     embedding_bytes,
                     app,
                     title,
                 ),
             )
             conn.commit()
-            if cursor.rowcount > 0: # Check if insert actually happened
+            if cursor.rowcount > 0:
                 last_row_id = cursor.lastrowid
-            # else:
-                # Optionally log that a duplicate timestamp was encountered
-                # print(f"Skipped inserting entry with duplicate timestamp: {timestamp}")
 
     except sqlite3.Error as e:
-        # More specific error handling can be added (e.g., IntegrityError for UNIQUE constraint)
         print(f"Database error during insertion: {e}")
     return last_row_id
