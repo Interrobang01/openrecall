@@ -11,12 +11,9 @@ install_requires = [
     "Flask==3.1.3",
     "numpy>=1.26,<3",
     "mss==10.1.0",
-    "sentence-transformers==5.3.0",
-    "transformers==5.3.0",
-    "torch==2.10.0",
-    "torchvision==0.25.0",
+    "fastembed==0.7.4",
     "onnxtr==0.8.1",
-    "Pillow==12.1.1",
+    "Pillow>=11.3.0,<12",
     "pynput==1.8.1",
 ]
 

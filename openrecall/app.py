@@ -1879,13 +1879,14 @@ def metrics():
           <th>Token recall</th>
           <th>Char similarity</th>
           <th>Embedding</th>
+          <th>Encoding</th>
           <th>DB insert</th>
           <th>Total</th>
           <th>Text?</th>
         </tr>
       </thead>
       <tbody id="timings-body">
-        <tr><td colspan="10" class="text-muted">Waiting for captures…</td></tr>
+        <tr><td colspan="11" class="text-muted">Waiting for captures…</td></tr>
       </tbody>
     </table>
   </div>
@@ -1918,6 +1919,7 @@ function loadMetrics() {
         '<td>' + tokenRecall + '</td>' +
         '<td>' + charSimilarity + '</td>' +
         '<td>' + t.embedding_ms + ' ms</td>' +
+        '<td>' + (t.encode_ms !== undefined ? t.encode_ms : '—') + ' ms</td>' +
         '<td>' + t.db_ms + ' ms</td>' +
         '<td><strong>' + t.total_ms + ' ms</strong></td>' +
         '<td>' + (t.had_text ? '✓' : '—') + '</td>';

@@ -14,6 +14,8 @@ from openrecall.config import (
     OPENRECALL_CAPTURE_INTERVAL_SECONDS,
     OPENRECALL_AV1_CRF,
     OPENRECALL_AV1_PRESET,
+    OPENRECALL_AV1_SVTAV1_PARAMS,
+    OPENRECALL_AV1_THREADS,
     OPENRECALL_AV1_PLAYBACK_FPS,
     OPENRECALL_AV1_SEGMENT_FRAMES,
     OPENRECALL_BLACKLIST_WINDOWS,
@@ -234,8 +236,15 @@ class MonitorAv1SegmentWriter:
             str(OPENRECALL_AV1_CRF),
             "-preset",
             OPENRECALL_AV1_PRESET,
-            segment_filepath,
         ]
+
+        if OPENRECALL_AV1_THREADS > 0:
+            ffmpeg_command.extend(["-threads", str(OPENRECALL_AV1_THREADS)])
+
+        if OPENRECALL_AV1_SVTAV1_PARAMS:
+            ffmpeg_command.extend(["-svtav1-params", OPENRECALL_AV1_SVTAV1_PARAMS])
+
+        ffmpeg_command.append(segment_filepath)
 
         self._process = subprocess.Popen(
             ffmpeg_command,
@@ -572,6 +581,7 @@ def record_screenshots_thread() -> None:
                         continue
 
                     t_embed_ms = 0.0
+                    t_encode_ms = 0.0
                     t_db_ms = 0.0
                     if text.strip():
                         _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
@@ -584,7 +594,7 @@ def record_screenshots_thread() -> None:
                         )
 
                         _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
-                        t_db_start = time.perf_counter()
+                        t_encode_start = time.perf_counter()
 
                         writer = segment_writers.setdefault(
                             monitor_id,
@@ -599,6 +609,9 @@ def record_screenshots_thread() -> None:
                             capture_id_ms,
                             monitor_id,
                         )
+                        t_encode_ms = (time.perf_counter() - t_encode_start) * 1000
+
+                        t_db_start = time.perf_counter()
 
                         insert_entry(
                             text,
@@ -614,7 +627,8 @@ def record_screenshots_thread() -> None:
                         t_db_ms = (time.perf_counter() - t_db_start) * 1000
                         _capture_print(
                             "db_write_stop "
-                            f"monitor={monitor_id} timestamp={timestamp} db_ms={t_db_ms:.1f} "
+                            f"monitor={monitor_id} timestamp={timestamp} "
+                            f"encode_ms={t_encode_ms:.1f} db_ms={t_db_ms:.1f} "
                             f"segment={segment_filename} pts_ms={segment_pts_ms} "
                             f"thumb={thumb_filename}"
                         )
@@ -630,6 +644,7 @@ def record_screenshots_thread() -> None:
                         "ocr_ms": round(t_ocr_ms, 1),
                         "ocr_primary_ms": ocr_diagnostics.get("primary_ms"),
                         "embedding_ms": round(t_embed_ms, 1),
+                        "encode_ms": round(t_encode_ms, 1),
                         "db_ms": round(t_db_ms, 1),
                         "total_ms": round(total_ms, 1),
                         "had_text": bool(text.strip()),
@@ -655,7 +670,8 @@ def record_screenshots_thread() -> None:
                         "metrics "
                         f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
                         f"mssim_ms={timing['mssim_ms']:.1f} ocr_ms={timing['ocr_ms']:.1f} "
-                        f"embedding_ms={timing['embedding_ms']:.1f} db_ms={timing['db_ms']:.1f} "
+                        f"embedding_ms={timing['embedding_ms']:.1f} "
+                        f"encode_ms={timing['encode_ms']:.1f} db_ms={timing['db_ms']:.1f} "
                         f"total_ms={timing['total_ms']:.1f} had_text={timing['had_text']} "
                         f"captures_this_session={capture_state['captures_this_session']}"
                     )

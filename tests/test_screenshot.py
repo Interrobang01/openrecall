@@ -122,6 +122,48 @@ class TestMonitorAv1SegmentWriterRotation(unittest.TestCase):
         self.assertEqual(pts_2, 1000)
 
 
+class TestMonitorAv1SegmentWriterCommand(unittest.TestCase):
+    def test_includes_threads_and_svtav1_params_when_configured(self):
+        writer = MonitorAv1SegmentWriter(monitor_id=7)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with mock.patch.object(screenshot, "OPENRECALL_AV1_THREADS", 2), mock.patch.object(
+            screenshot,
+            "OPENRECALL_AV1_SVTAV1_PARAMS",
+            "lp=2:scd=0",
+        ), mock.patch.object(
+            screenshot.subprocess,
+            "Popen",
+            return_value=DummyWriterProcess(),
+        ) as popen_mock:
+            writer.write_frame(frame, timestamp_ms=1000)
+
+        ffmpeg_cmd = popen_mock.call_args[0][0]
+        self.assertIn("-threads", ffmpeg_cmd)
+        self.assertIn("2", ffmpeg_cmd)
+        self.assertIn("-svtav1-params", ffmpeg_cmd)
+        self.assertIn("lp=2:scd=0", ffmpeg_cmd)
+
+    def test_omits_threads_and_svtav1_params_when_defaults_used(self):
+        writer = MonitorAv1SegmentWriter(monitor_id=8)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with mock.patch.object(screenshot, "OPENRECALL_AV1_THREADS", 0), mock.patch.object(
+            screenshot,
+            "OPENRECALL_AV1_SVTAV1_PARAMS",
+            "",
+        ), mock.patch.object(
+            screenshot.subprocess,
+            "Popen",
+            return_value=DummyWriterProcess(),
+        ) as popen_mock:
+            writer.write_frame(frame, timestamp_ms=1000)
+
+        ffmpeg_cmd = popen_mock.call_args[0][0]
+        self.assertNotIn("-threads", ffmpeg_cmd)
+        self.assertNotIn("-svtav1-params", ffmpeg_cmd)
+
+
 class TestCapturePauseAndBlacklist(unittest.TestCase):
     def setUp(self):
         screenshot.capture_state["paused_until_ts"] = 0
