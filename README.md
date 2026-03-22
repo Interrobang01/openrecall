@@ -65,9 +65,8 @@ OpenRecall offers several key advantages over closed-source alternatives:
   - Metrics dashboard (`/metrics`) and JSON status/storage APIs.
   - Storage badge, startup recovery badge, and open-storage-folder action from the UI.
 
-- **OCR tuning and A/B diagnostics**
+- **OCR tuning**
   - Configurable OCR detector/recognizer architectures and execution providers.
-  - Optional OCR A/B mode with side-by-side text payload and quality overlap metrics.
   - Device and thread controls for OCR and embeddings.
 
 - **Privacy controls and safety defaults**
@@ -159,9 +158,6 @@ You can tune performance with environment variables:
 - `OPENRECALL_OCR_CPU_THREADS` (override ONNX Runtime CPU threads; default auto)
 - `OPENRECALL_OCR_DET_ARCH` (default `db_mobilenet_v3_large`)
 - `OPENRECALL_OCR_RECO_ARCH` (default `crnn_mobilenet_v3_small` for speed/quality balance)
-- `OPENRECALL_OCR_AB_TEST` (set `1`/`true` to run secondary OCR model for live A/B metrics)
-- `OPENRECALL_OCR_AB_DET_ARCH` (A/B detector override; default follows primary detector)
-- `OPENRECALL_OCR_AB_RECO_ARCH` (A/B recognizer override; default `crnn_mobilenet_v3_large`)
 - `OPENRECALL_STORAGE_BACKEND` (must be `av1_hybrid`)
 - `OPENRECALL_FFMPEG_BIN` (default `ffmpeg`)
 - `OPENRECALL_AV1_CRF` (default `38`, lower = larger files / higher quality)
@@ -192,32 +188,6 @@ OPENRECALL_CAPTURE_INTERVAL_SECONDS=5 OPENRECALL_OCR_MAX_DIMENSION=960 python3 -
 # Force CPU explicitly
 OPENRECALL_EMBEDDING_DEVICE=cpu OPENRECALL_OCR_DEVICE=cpu python3 -m openrecall.app
 ```
-
-## Directly compare OCR text (small vs large)
-
-If A/B testing is enabled, OpenRecall can expose the latest OCR text from both models.
-
-1. Start OpenRecall with A/B enabled (example below compares small recognizer vs large recognizer):
-
-```bash
-OPENRECALL_OCR_AB_TEST=1 \
-OPENRECALL_OCR_RECO_ARCH=crnn_mobilenet_v3_small \
-OPENRECALL_OCR_AB_RECO_ARCH=crnn_mobilenet_v3_large \
-python3 -m openrecall.app
-```
-
-2. Generate a capture (change screen content so a new frame is saved).
-
-3. Fetch the latest side-by-side OCR payload:
-
-```bash
-curl -sS http://127.0.0.1:8082/api/ocr-ab-compare
-```
-
-Response fields:
-- `primary_text`: text from the primary OCR model (usually the faster/smaller config)
-- `ab_text`: text from the A/B model (usually the larger reference)
-- `token_recall` and `char_similarity`: quality overlap metrics for that capture
 
 ## Uninstall instructions
 

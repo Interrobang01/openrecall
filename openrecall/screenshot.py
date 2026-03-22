@@ -48,7 +48,6 @@ capture_state: Dict[str, Any] = {
     "captures_this_session": 0,
     "last_mssim": None,
     "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
-    "last_ocr_ab_compare": None,
     "paused_until_ts": 0,
     "paused_indefinitely": False,
     "stop_requested": False,
@@ -649,19 +648,6 @@ def record_screenshots_thread() -> None:
                         "total_ms": round(total_ms, 1),
                         "had_text": bool(text.strip()),
                     }
-                    if ocr_diagnostics.get("ab_enabled"):
-                        timing["ocr_ab_ms"] = ocr_diagnostics.get("ab_ms")
-                        timing["ocr_ab_text_len"] = ocr_diagnostics.get("ab_text_len")
-                        timing["ocr_ab_token_recall"] = ocr_diagnostics.get("token_recall")
-                        timing["ocr_ab_char_similarity"] = ocr_diagnostics.get("char_similarity")
-                        capture_state["last_ocr_ab_compare"] = {
-                            "timestamp": timestamp,
-                            "monitor_id": monitor_id,
-                            "primary_text": text,
-                            "ab_text": ocr_diagnostics.get("ab_text", ""),
-                            "token_recall": ocr_diagnostics.get("token_recall"),
-                            "char_similarity": ocr_diagnostics.get("char_similarity"),
-                        }
 
                     capture_state["recent_timings"].append(timing)
                     capture_state["last_capture_ts"] = timestamp

@@ -1704,16 +1704,6 @@ def api_recovery_status():
     return jsonify(_json_safe(startup_recovery_state))
 
 
-@app.route("/api/ocr-ab-compare")
-def api_ocr_ab_compare():
-    """Returns latest OCR A/B text comparison payload."""
-    compare_payload = capture_state.get("last_ocr_ab_compare")
-    if not compare_payload:
-        return jsonify({"error": "No OCR A/B comparison captured yet."}), 404
-
-    return jsonify(_json_safe(compare_payload))
-
-
 @app.route("/open-folder", methods=["POST"])
 def open_folder():
     """Opens the storage folder in the system file manager."""
@@ -1875,9 +1865,6 @@ def metrics():
           <th>Time</th>
           <th>MSSIM check</th>
           <th>OCR</th>
-          <th>OCR (A/B)</th>
-          <th>Token recall</th>
-          <th>Char similarity</th>
           <th>Embedding</th>
           <th>Encoding</th>
           <th>DB insert</th>
@@ -1886,7 +1873,7 @@ def metrics():
         </tr>
       </thead>
       <tbody id="timings-body">
-        <tr><td colspan="11" class="text-muted">Waiting for captures…</td></tr>
+        <tr><td colspan="8" class="text-muted">Waiting for captures…</td></tr>
       </tbody>
     </table>
   </div>
@@ -1908,16 +1895,10 @@ function loadMetrics() {
     // most recent first
     [...timings].reverse().forEach(t => {
       const tr = document.createElement('tr');
-      const abMs = t.ocr_ab_ms !== undefined ? (t.ocr_ab_ms + ' ms') : '—';
-      const tokenRecall = t.ocr_ab_token_recall !== undefined ? t.ocr_ab_token_recall : '—';
-      const charSimilarity = t.ocr_ab_char_similarity !== undefined ? t.ocr_ab_char_similarity : '—';
       tr.innerHTML =
         '<td>' + new Date(t.timestamp * 1000).toLocaleTimeString() + '</td>' +
         '<td>' + t.mssim_ms + ' ms</td>' +
         '<td>' + t.ocr_ms + ' ms</td>' +
-        '<td>' + abMs + '</td>' +
-        '<td>' + tokenRecall + '</td>' +
-        '<td>' + charSimilarity + '</td>' +
         '<td>' + t.embedding_ms + ' ms</td>' +
         '<td>' + (t.encode_ms !== undefined ? t.encode_ms : '—') + ' ms</td>' +
         '<td>' + t.db_ms + ' ms</td>' +

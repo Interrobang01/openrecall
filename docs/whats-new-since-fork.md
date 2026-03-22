@@ -14,7 +14,7 @@ It focuses on user-visible and operator-visible changes (UI, capture/storage, se
 - Stronger capture controls (pause/resume, pause forever, hotkeys, hard stop).
 - Runtime configuration page backed by `openrecall_config.json`.
 - Search upgrades (metric selector, expression queries, phrase handling).
-- OCR architecture controls and optional A/B quality diagnostics.
+- OCR architecture controls for runtime tuning.
 - Startup resilience: ffmpeg capability checks, segment decode fallbacks, quarantine/cleanup for unreadable recent segments.
 - Metrics and status APIs/UI to observe performance and storage.
 
@@ -71,7 +71,6 @@ Major additions inferred from this overhaul:
 - Added OCR architecture/provider controls:
   - detector/recognizer architecture overrides,
   - provider and thread settings,
-  - optional OCR A/B comparison endpoint (`/api/ocr-ab-compare`).
 - NLP fallback hardening (`5b700ce`):
   - improved embedding model load handling,
   - explicit CPU fallback behavior.
@@ -103,7 +102,6 @@ Major additions inferred from this overhaul:
 - `/api/stats` — storage/database stats
 - `/api/status` — capture runtime status
 - `/api/recovery-status` — startup recovery summary
-- `/api/ocr-ab-compare` — latest OCR A/B compare payload
 - `/open-folder` — open storage folder from UI
 
 ### Capture control endpoints
@@ -142,9 +140,6 @@ Major additions inferred from this overhaul:
   - `OPENRECALL_OCR_CPU_THREADS`
   - `OPENRECALL_OCR_DET_ARCH`
   - `OPENRECALL_OCR_RECO_ARCH`
-  - `OPENRECALL_OCR_AB_TEST`
-  - `OPENRECALL_OCR_AB_DET_ARCH`
-  - `OPENRECALL_OCR_AB_RECO_ARCH`
 - Privacy/hotkeys:
   - `OPENRECALL_BLACKLIST_WINDOWS`
   - `OPENRECALL_BLACKLIST_WORDS`

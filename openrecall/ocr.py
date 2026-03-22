@@ -1,8 +1,6 @@
 import logging
 import os
-import re
 import time
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from onnxruntime import (
@@ -17,12 +15,10 @@ from onnxtr.models.engine import EngineConfig
 logger = logging.getLogger(__name__)
 
 ocr: Optional[Any] = None
-ocr_ab: Optional[Any] = None
 _ocr_device: str = "auto"
 
 DEFAULT_DET_ARCH = "db_mobilenet_v3_large"
 DEFAULT_RECO_ARCH = "crnn_mobilenet_v3_small"
-DEFAULT_AB_RECO_ARCH = "crnn_mobilenet_v3_large"
 
 
 def _get_env_int(name: str, default: int, minimum: int) -> int:
@@ -35,38 +31,6 @@ def _get_env_int(name: str, default: int, minimum: int) -> int:
     except ValueError:
         logger.warning("Invalid %s value '%s'. Falling back to %s.", name, raw_value, default)
         return default
-
-
-def _normalize_text(text: str) -> str:
-    return " ".join(text.lower().split())
-
-
-def _token_counter(text: str) -> Counter:
-    return Counter(re.findall(r"\w+", text.lower()))
-
-
-def _token_recall(reference_text: str, predicted_text: str) -> float:
-    reference_tokens = _token_counter(_normalize_text(reference_text))
-    predicted_tokens = _token_counter(_normalize_text(predicted_text))
-    reference_total = sum(reference_tokens.values())
-    if reference_total == 0:
-        return 1.0 if sum(predicted_tokens.values()) == 0 else 0.0
-    overlap = sum(min(v, predicted_tokens.get(k, 0)) for k, v in reference_tokens.items())
-    return overlap / reference_total
-
-
-def _char_similarity(reference_text: str, predicted_text: str) -> float:
-    ref = _normalize_text(reference_text)
-    pred = _normalize_text(predicted_text)
-    if not ref and not pred:
-        return 1.0
-    if not ref or not pred:
-        return 0.0
-
-    # SequenceMatcher ratio in [0, 1]
-    import difflib
-
-    return float(difflib.SequenceMatcher(a=ref, b=pred).ratio())
 
 
 def _extract_lines(result: Any) -> str:
@@ -172,35 +136,6 @@ def _build_ocr_model() -> Any:
     return ocr_model
 
 
-def _is_ab_enabled() -> bool:
-    raw = (os.getenv("OPENRECALL_OCR_AB_TEST") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _build_ab_ocr_model() -> Any:
-    det_arch = (os.getenv("OPENRECALL_OCR_AB_DET_ARCH") or os.getenv("OPENRECALL_OCR_DET_ARCH") or DEFAULT_DET_ARCH).strip()
-    reco_arch = (os.getenv("OPENRECALL_OCR_AB_RECO_ARCH") or DEFAULT_AB_RECO_ARCH).strip()
-    runtime_device = get_ocr_runtime_device()
-    engine_cfg = _build_engine_config(runtime_device)
-    ab_model = ocr_predictor(
-        det_arch=det_arch,
-        reco_arch=reco_arch,
-        det_engine_cfg=engine_cfg,
-        reco_engine_cfg=engine_cfg,
-        assume_straight_pages=True,
-        detect_orientation=False,
-        straighten_pages=False,
-        detect_language=False,
-    )
-
-    logger.info(
-        "OCR A/B model initialized det_arch='%s' reco_arch='%s'.",
-        det_arch,
-        reco_arch,
-    )
-    return ab_model
-
-
 def _get_ocr_model() -> Any:
     """Returns a lazily initialized OCR model instance."""
     global ocr
@@ -209,19 +144,6 @@ def _get_ocr_model() -> Any:
         ocr = _build_ocr_model()
 
     return ocr
-
-
-def _get_ab_ocr_model() -> Optional[Any]:
-    global ocr_ab
-
-    if not _is_ab_enabled():
-        return None
-
-    if ocr_ab is None:
-        ocr_ab = _build_ab_ocr_model()
-
-    return ocr_ab
-
 
 def get_ocr_runtime_device() -> str:
     """Returns the OCR runtime provider preference."""
@@ -237,7 +159,7 @@ def extract_text_from_image(image: Any) -> str:
 
 
 def extract_text_and_diagnostics_from_image(image: Any) -> Tuple[str, Dict[str, Any]]:
-    """Runs OCR and returns text plus optional A/B diagnostics."""
+    """Runs OCR and returns text plus capture diagnostics."""
     ocr_model = _get_ocr_model()
 
     t_primary_start = time.perf_counter()
@@ -247,29 +169,5 @@ def extract_text_and_diagnostics_from_image(image: Any) -> Tuple[str, Dict[str, 
     primary_text = _extract_lines(primary_result)
     diagnostics: Dict[str, Any] = {
         "primary_ms": round(primary_ms, 1),
-        "ab_enabled": False,
     }
-
-    ab_model = _get_ab_ocr_model()
-    if ab_model is None:
-        return primary_text, diagnostics
-
-    t_ab_start = time.perf_counter()
-    ab_result = ab_model([image])
-    ab_ms = (time.perf_counter() - t_ab_start) * 1000
-
-    ab_text = _extract_lines(ab_result)
-    diagnostics.update(
-        {
-            "ab_enabled": True,
-            "ab_ms": round(ab_ms, 1),
-            "ab_text": ab_text,
-            "ab_text_len": len(ab_text.strip()),
-            # Main metric reports how much primary OCR covers AB reference text.
-            # With optimized defaults (primary small-rec, AB large-rec), lower means quality loss.
-            "token_recall": round(_token_recall(ab_text, primary_text), 3),
-            "char_similarity": round(_char_similarity(primary_text, ab_text), 3),
-        }
-    )
-
     return primary_text, diagnostics
