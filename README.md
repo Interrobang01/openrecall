@@ -115,7 +115,12 @@ For a commit-by-commit summary of everything added since this fork (including bo
 
 To install:
 ```
-python3 -m pip install --upgrade --no-cache-dir git+https://github.com/openrecall/openrecall.git
+python3 -m pip install --upgrade --no-cache-dir git+https://github.com/Interrobang01/openrecall.git
+```
+
+This will almost certainly not work, so afterwards, run:
+```
+claude --model opus "Please help me fix my install of openrecall https://github.com/Interrobang01/openrecall"
 ```
 
 To run:
@@ -132,15 +137,15 @@ Open your browser to:
 
 ## Performance & GPU notes
 
-OpenRecall runs OCR through ONNX Runtime (OnnxTR) and embeddings through PyTorch.
+OpenRecall runs OCR and embeddings through ONNX Runtime.
 
-Embedding acceleration is available only when your PyTorch build supports your GPU backend.
+Embedding acceleration depends on your ONNX Runtime execution providers.
 
-- NVIDIA: CUDA build of PyTorch
-- Apple Silicon: MPS backend
-- AMD on Linux: ROCm-compatible GPU **and** a ROCm-enabled PyTorch build (where `torch.version.hip` is set)
+- NVIDIA: `CUDAExecutionProvider`
+- Apple Silicon: `CoreMLExecutionProvider`
+- CPU fallback: `CPUExecutionProvider`
 
-If `torch.cuda.is_available()` is false and `torch.version.hip` is `None`, OpenRecall runs on CPU.
+If a requested provider is unavailable, OpenRecall falls back to CPU.
 
 You can tune performance with environment variables:
 
@@ -148,7 +153,8 @@ You can tune performance with environment variables:
 - `OPENRECALL_SIMILARITY_FRAME_WIDTH` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_OCR_MAX_DIMENSION` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_VERBOSE_CAPTURE_LOGS` (default `false`; set to `1`/`true` to enable stage/timing CLI prints)
-- `OPENRECALL_EMBEDDING_DEVICE` (override embedding device, e.g. `cpu`)
+- `OPENRECALL_EMBEDDING_DEVICE` (embedding provider preference: `auto`/`cpu`/`cuda`/`coreml`; default `auto`)
+- `OPENRECALL_EMBEDDING_MODEL` (embedding model name; default `sentence-transformers/all-MiniLM-L6-v2`)
 - `OPENRECALL_OCR_DEVICE` (OCR provider preference: `auto`/`cpu`/`cuda`/`coreml`; default `auto`)
 - `OPENRECALL_OCR_CPU_THREADS` (override ONNX Runtime CPU threads; default auto)
 - `OPENRECALL_OCR_DET_ARCH` (default `db_mobilenet_v3_large`)
@@ -160,6 +166,8 @@ You can tune performance with environment variables:
 - `OPENRECALL_FFMPEG_BIN` (default `ffmpeg`)
 - `OPENRECALL_AV1_CRF` (default `38`, lower = larger files / higher quality)
 - `OPENRECALL_AV1_PRESET` (default `8`, lower = slower encode / better compression)
+- `OPENRECALL_AV1_THREADS` (default `0` = ffmpeg default; set `1..N` to cap encoder threads)
+- `OPENRECALL_AV1_SVTAV1_PARAMS` (default empty; raw `-svtav1-params` string, e.g. `lp=2:scd=0`)
 - `OPENRECALL_AV1_PLAYBACK_FPS` (default `2.0`, min `0.1`; encoded segment framerate used by video players)
 - `OPENRECALL_AV1_SEGMENT_FRAMES` (default `30`; min `1`; rotates segments by frame count)
 - `OPENRECALL_AV1_SEGMENT_SECONDS` (legacy/default-derivation knob; default `120`, min `1.0`)
