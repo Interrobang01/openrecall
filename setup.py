@@ -17,6 +17,7 @@ install_requires = [
     "torchvision==0.25.0",
     "onnxtr==0.8.1",
     "Pillow==12.1.1",
+    "pynput==1.8.1",
 ]
 
 # Define OS-specific dependencies

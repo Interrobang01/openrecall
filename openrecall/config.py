@@ -228,6 +228,63 @@ OPENRECALL_VERBOSE_CAPTURE_LOGS = _get_config_bool(
     "OPENRECALL_VERBOSE_CAPTURE_LOGS",
     default=False,
 )
+OPENRECALL_BLACKLIST_LEGACY_DEFAULT_TERMS = (
+    "bitwarden,Password Manager,tor,incognito,приватный просмотр"
+)
+OPENRECALL_BLACKLIST_DEFAULT_TERMS = (
+    "bitwarden,Password Manager,Tor Browser,incognito,приватный просмотр"
+)
+
+
+def _normalize_blacklist_terms(raw_terms: str) -> str:
+    """Normalizes comma-separated blacklist terms for comparison."""
+    return ",".join(
+        term.strip().lower()
+        for term in (raw_terms or "").split(",")
+        if term and term.strip()
+    )
+
+
+def _migrate_legacy_blacklist_default(raw_terms: str) -> str:
+    """Rewrites legacy default blacklist values to the safer current defaults."""
+    if (
+        _normalize_blacklist_terms(raw_terms)
+        == _normalize_blacklist_terms(OPENRECALL_BLACKLIST_LEGACY_DEFAULT_TERMS)
+    ):
+        return OPENRECALL_BLACKLIST_DEFAULT_TERMS
+    return raw_terms
+
+
+OPENRECALL_BLACKLIST_WINDOWS = _get_config_str(
+    "OPENRECALL_BLACKLIST_WINDOWS",
+    OPENRECALL_BLACKLIST_DEFAULT_TERMS,
+)
+OPENRECALL_BLACKLIST_WINDOWS = _migrate_legacy_blacklist_default(
+    OPENRECALL_BLACKLIST_WINDOWS
+)
+OPENRECALL_BLACKLIST_WORDS = _get_config_str(
+    "OPENRECALL_BLACKLIST_WORDS",
+    OPENRECALL_BLACKLIST_DEFAULT_TERMS,
+)
+OPENRECALL_BLACKLIST_WORDS = _migrate_legacy_blacklist_default(
+    OPENRECALL_BLACKLIST_WORDS
+)
+OPENRECALL_HOTKEY_PAUSE_5M = _get_config_str(
+    "OPENRECALL_HOTKEY_PAUSE_5M",
+    "<ctrl>+<shift>+<alt>+5",
+)
+OPENRECALL_HOTKEY_PAUSE_30M = _get_config_str(
+    "OPENRECALL_HOTKEY_PAUSE_30M",
+    "<ctrl>+<shift>+<alt>+0",
+)
+OPENRECALL_HOTKEY_PAUSE_FOREVER = _get_config_str(
+    "OPENRECALL_HOTKEY_PAUSE_FOREVER",
+    "<ctrl>+<shift>+<alt>+l",
+)
+OPENRECALL_HOTKEY_RESUME = _get_config_str(
+    "OPENRECALL_HOTKEY_RESUME",
+    "<ctrl>+<shift>+<alt>+p",
+)
 
 RUNTIME_CONFIG_KEYS = [
     "OPENRECALL_STORAGE_BACKEND",
@@ -242,6 +299,12 @@ RUNTIME_CONFIG_KEYS = [
     "OPENRECALL_AV1_SEGMENT_FRAMES",
     "OPENRECALL_SIMILARITY_FRAME_WIDTH",
     "OPENRECALL_VERBOSE_CAPTURE_LOGS",
+    "OPENRECALL_BLACKLIST_WINDOWS",
+    "OPENRECALL_BLACKLIST_WORDS",
+    "OPENRECALL_HOTKEY_PAUSE_5M",
+    "OPENRECALL_HOTKEY_PAUSE_30M",
+    "OPENRECALL_HOTKEY_PAUSE_FOREVER",
+    "OPENRECALL_HOTKEY_RESUME",
 ]
 
 
@@ -260,6 +323,12 @@ def get_runtime_config_values() -> Dict[str, object]:
         "OPENRECALL_AV1_SEGMENT_FRAMES": OPENRECALL_AV1_SEGMENT_FRAMES,
         "OPENRECALL_SIMILARITY_FRAME_WIDTH": OPENRECALL_SIMILARITY_FRAME_WIDTH,
         "OPENRECALL_VERBOSE_CAPTURE_LOGS": OPENRECALL_VERBOSE_CAPTURE_LOGS,
+        "OPENRECALL_BLACKLIST_WINDOWS": OPENRECALL_BLACKLIST_WINDOWS,
+        "OPENRECALL_BLACKLIST_WORDS": OPENRECALL_BLACKLIST_WORDS,
+        "OPENRECALL_HOTKEY_PAUSE_5M": OPENRECALL_HOTKEY_PAUSE_5M,
+        "OPENRECALL_HOTKEY_PAUSE_30M": OPENRECALL_HOTKEY_PAUSE_30M,
+        "OPENRECALL_HOTKEY_PAUSE_FOREVER": OPENRECALL_HOTKEY_PAUSE_FOREVER,
+        "OPENRECALL_HOTKEY_RESUME": OPENRECALL_HOTKEY_RESUME,
     }
 
 

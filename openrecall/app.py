@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 from threading import Thread
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
@@ -33,7 +33,14 @@ from openrecall.database import (
     get_timestamps,
     get_timeline_entries,
 )
-from openrecall.nlp import cosine_similarity, get_embedding
+from openrecall.nlp import (
+  EMBEDDING_DIM,
+  cosine_similarity,
+  dot_product,
+  euclidean_distance,
+  get_embedding,
+  manhattan_distance,
+)
 from openrecall.screenshot import (
   capture_state,
   clear_capture_pause,
@@ -41,7 +48,9 @@ from openrecall.screenshot import (
   record_screenshots_thread,
   request_capture_stop,
   set_capture_pause_for_seconds,
+  set_capture_pause_forever,
 )
+from openrecall.hotkeys import start_hotkey_listener
 from openrecall.utils import human_readable_time, timestamp_to_human_readable
 
 app = Flask(__name__)
@@ -62,6 +71,13 @@ startup_recovery_state: Dict[str, object] = {
   "entries_removed": 0,
   "thumbs_removed": 0,
   "cache_removed": 0,
+}
+
+SEARCH_METRICS = {
+  "cosine": "Cosine",
+  "dot": "Dot product",
+  "euclidean": "Euclidean distance",
+  "manhattan": "Manhattan distance",
 }
 
 
@@ -147,6 +163,7 @@ base_template = """
     <div class="btn-group btn-group-sm mr-2" role="group" aria-label="Capture controls">
       <button class="btn btn-outline-secondary" id="pause-5m-btn" title="Pause capture for 5 minutes">Pause 5m</button>
       <button class="btn btn-outline-secondary" id="pause-30m-btn" title="Pause capture for 30 minutes">Pause 30m</button>
+      <button class="btn btn-outline-secondary" id="pause-forever-btn" title="Pause capture indefinitely">Pause forever</button>
       <button class="btn btn-outline-secondary" id="resume-btn" title="Resume capture">Resume</button>
     </div>
 
@@ -156,6 +173,12 @@ base_template = """
     <form class="form-inline flex-grow-1 d-flex" action="/search" method="get" style="min-width:200px;">
       <input class="form-control flex-grow-1 mr-1" type="search" name="q" placeholder="Search" aria-label="Search"
              value="{{ request.args.get('q', '') }}">
+      <select class="form-control mr-1" name="metric" aria-label="Search metric" style="max-width:200px;">
+        <option value="cosine" {% if request.args.get('metric', 'cosine') == 'cosine' %}selected{% endif %}>Cosine</option>
+        <option value="dot" {% if request.args.get('metric') == 'dot' %}selected{% endif %}>Dot product</option>
+        <option value="euclidean" {% if request.args.get('metric') == 'euclidean' %}selected{% endif %}>Euclidean distance</option>
+        <option value="manhattan" {% if request.args.get('metric') == 'manhattan' %}selected{% endif %}>Manhattan distance</option>
+      </select>
       <button class="btn btn-outline-secondary" type="submit"><i class="bi bi-search"></i></button>
     </form>
 
@@ -215,8 +238,12 @@ function pollStatus() {
       setTimeout(() => dot.classList.remove('active'), 800);
     }
     if (paused) {
-      const left = Math.max(0, pausedUntil - nowTs);
-      info.textContent = 'paused ' + left + 's';
+      if (data.paused_indefinitely) {
+        info.textContent = 'paused indefinitely';
+      } else {
+        const left = Math.max(0, pausedUntil - nowTs);
+        info.textContent = 'paused ' + left + 's';
+      }
       dot.title = 'Capture paused';
       dot.classList.remove('active');
     } else if (data.last_capture_ts) {
@@ -326,6 +353,18 @@ if (pause30mButton) {
   pause30mButton.addEventListener('click', function() {
     postJson('/api/capture/pause', {minutes: 30}).then(() => {
       setCaptureFeedback('Capture paused for 30 minutes.', 3500);
+      pollStatus();
+    }).catch(() => {
+      setCaptureFeedback('Failed to pause capture.', 4000);
+    });
+  });
+}
+
+const pauseForeverButton = document.getElementById('pause-forever-btn');
+if (pauseForeverButton) {
+  pauseForeverButton.addEventListener('click', function() {
+    postJson('/api/capture/pause-forever', {}).then(() => {
+      setCaptureFeedback('Capture paused indefinitely.', 3500);
       pollStatus();
     }).catch(() => {
       setCaptureFeedback('Failed to pause capture.', 4000);
@@ -571,6 +610,127 @@ def _entry_matches_exact_phrases(entry_text: str, exact_phrases: List[str]) -> b
     return all(phrase.lower() in haystack for phrase in exact_phrases)
 
 
+def _resolve_search_metric(raw_metric: str) -> str:
+    """Normalizes and validates the requested search metric."""
+    candidate = (raw_metric or "").strip().lower()
+    if candidate in SEARCH_METRICS:
+      return candidate
+    return "cosine"
+
+
+def _contains_unquoted_parentheses(raw_query: str) -> bool:
+    """Returns whether raw query contains unquoted parentheses."""
+    in_quotes = False
+    escape = False
+    for char in raw_query:
+      if escape:
+        escape = False
+        continue
+      if char == "\\":
+        escape = True
+        continue
+      if char == '"':
+        in_quotes = not in_quotes
+        continue
+      if not in_quotes and char in "()":
+        return True
+    return False
+
+
+def _parse_embedding_expression(raw_query: str) -> Optional[List[Tuple[str, int]]]:
+    """Parses expressions like '(queen) - (king) + (woman)' into weighted terms."""
+    if not _contains_unquoted_parentheses(raw_query):
+      return None
+
+    expression = raw_query.strip()
+    if not expression:
+      return None
+
+    terms: List[Tuple[str, int]] = []
+    index = 0
+    next_sign = 1
+
+    while index < len(expression):
+      while index < len(expression) and expression[index].isspace():
+        index += 1
+
+      if index >= len(expression):
+        break
+
+      if expression[index] != "(":
+        return None
+
+      index += 1
+      start_index = index
+      has_nested_parenthesis = False
+      while index < len(expression) and expression[index] != ")":
+        if expression[index] == "(":
+          has_nested_parenthesis = True
+        index += 1
+
+      if index >= len(expression) or has_nested_parenthesis:
+        return None
+
+      term_text = expression[start_index:index].strip()
+      if not term_text:
+        return None
+
+      terms.append((term_text, next_sign))
+      index += 1
+
+      while index < len(expression) and expression[index].isspace():
+        index += 1
+
+      if index >= len(expression):
+        break
+
+      operator = expression[index]
+      if operator == "+":
+        next_sign = 1
+      elif operator == "-":
+        next_sign = -1
+      else:
+        return None
+      index += 1
+
+    return terms if terms else None
+
+
+def _compute_search_score(
+    query_embedding: np.ndarray,
+    entry_embedding: np.ndarray,
+    metric: str,
+) -> float:
+    """Computes metric-specific score between query and entry embeddings."""
+    if metric == "dot":
+      return dot_product(query_embedding, entry_embedding)
+    if metric == "euclidean":
+      return euclidean_distance(query_embedding, entry_embedding)
+    if metric == "manhattan":
+      return manhattan_distance(query_embedding, entry_embedding)
+    return cosine_similarity(query_embedding, entry_embedding)
+
+
+def _score_sort_descending(metric: str) -> bool:
+    """Returns whether higher score means better match for metric."""
+    return metric in {"cosine", "dot"}
+
+
+def _format_search_score(metric: str, score: float, used_expression: bool) -> str:
+    """Formats metric score text for UI badges."""
+    if metric == "cosine":
+      return f"{round(score * 100, 1)}%"
+    if metric == "dot":
+      return f"{score:.4f}"
+    if metric == "euclidean":
+      return f"d={score:.4f}"
+    if metric == "manhattan":
+      return f"L1={score:.4f}"
+    if used_expression:
+      return f"{score:.4f}"
+    return "—"
+
+
 @app.route("/")
 def timeline():
     timeline_entries = [
@@ -608,6 +768,9 @@ def timeline():
         </div>
         <div class="col-auto">
           <button class="btn btn-sm btn-outline-secondary" id="resetRange">Reset</button>
+        </div>
+        <div class="col-auto">
+          <button class="btn btn-sm btn-outline-secondary" id="toggleMonitorOrder">Reverse monitor order</button>
         </div>
         <div class="col-auto text-muted small" id="rangeInfo"></div>
       </div>
@@ -654,6 +817,7 @@ let groupedByTimestamp = [];
 const monitorIds = Array.from(
   new Set(allEntries.map(item => Number(item.monitor_id)))
 ).sort((a, b) => a - b);
+let reverseMonitorOrder = false;
 
 const monitorColumnClass =
   monitorIds.length <= 1
@@ -822,7 +986,9 @@ function upgradeTimelineModalImage() {
 function renderMonitorPanels(group) {
   monitorPanels.innerHTML = '';
 
-  monitorIds.forEach(monitorId => {
+  const orderedMonitorIds = reverseMonitorOrder ? monitorIds.slice().reverse() : monitorIds;
+
+  orderedMonitorIds.forEach(monitorId => {
     const exactEntry = group.items[String(monitorId)] || null;
     const entry = exactEntry || findLatestForMonitorAtOrBefore(monitorId, group.timestamp);
     const isFallback = !exactEntry && !!entry;
@@ -981,6 +1147,12 @@ document.getElementById('resetRange').addEventListener('click', function() {
   applyFilter();
 });
 
+document.getElementById('toggleMonitorOrder').addEventListener('click', function() {
+  reverseMonitorOrder = !reverseMonitorOrder;
+  this.textContent = reverseMonitorOrder ? 'Normal monitor order' : 'Reverse monitor order';
+  updateDisplay();
+});
+
 applyFilter();
 </script>
 {% else %}
@@ -997,8 +1169,10 @@ applyFilter();
 @app.route("/search")
 def search():
     q = (request.args.get("q") or "").strip()
+    metric = _resolve_search_metric(request.args.get("metric") or "cosine")
     entries = get_all_entries()
     semantic_query, exact_phrases = _parse_search_query(q)
+    expression_terms = _parse_embedding_expression(q)
 
     candidate_indices = [
         index
@@ -1007,16 +1181,27 @@ def search():
     ]
 
     results = []
-    if semantic_query:
-        query_embedding = get_embedding(semantic_query)
+    if semantic_query or expression_terms:
+        if expression_terms:
+            query_embedding = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+            for term_text, sign in expression_terms:
+                query_embedding = query_embedding + (sign * get_embedding(term_text))
+        else:
+            query_embedding = get_embedding(semantic_query)
+
         scored_candidates = []
         for index in candidate_indices:
             emb = np.asarray(entries[index].embedding, dtype=np.float32)
-            similarity = cosine_similarity(query_embedding, emb)
-            scored_candidates.append((index, similarity))
+            if emb.size == 0 or emb.shape != query_embedding.shape:
+                continue
+            score = _compute_search_score(query_embedding, emb, metric)
+            scored_candidates.append((index, score))
 
-        scored_candidates.sort(key=lambda item: item[1], reverse=True)
-        for index, similarity in scored_candidates:
+        scored_candidates.sort(
+            key=lambda item: item[1],
+            reverse=_score_sort_descending(metric),
+        )
+        for index, score in scored_candidates:
             results.append(
                 {
                     "timestamp": entries[index].timestamp,
@@ -1027,7 +1212,7 @@ def search():
                     "app": entries[index].app or "",
                     "title": entries[index].title or "",
                     "text": entries[index].text or "",
-                    "similarity": round(similarity * 100, 1),
+                    "score": _format_search_score(metric, score, bool(expression_terms)),
                 }
             )
     elif exact_phrases:
@@ -1042,7 +1227,7 @@ def search():
                     "app": entries[index].app or "",
                     "title": entries[index].title or "",
                     "text": entries[index].text or "",
-                    "similarity": 100.0,
+                    "score": "Exact",
                 }
             )
 
@@ -1056,7 +1241,7 @@ def search():
   {% if not results %}
     <div class="alert alert-info">No results.</div>
   {% else %}
-  <p class="text-muted small mb-2">{{ results|length }} results</p>
+  <p class="text-muted small mb-2">{{ results|length }} results · {{ metric_label }}</p>
   <div class="row">
     {% for r in results %}
     <div class="col-md-3 mb-4">
@@ -1068,7 +1253,7 @@ def search():
         </a>
         <div class="card-body p-2">
           <div class="d-flex justify-content-between align-items-start mb-1">
-            <span class="badge badge-primary similarity-badge">{{ r.similarity }}%</span>
+            <span class="badge badge-primary similarity-badge">{{ r.score }}</span>
             <span class="card-meta">{{ r.timestamp | timestamp_to_human_readable }}</span>
           </div>
           <div class="card-meta">Monitor {{ r.monitor_id }}</div>
@@ -1189,7 +1374,7 @@ document.addEventListener('DOMContentLoaded', function() {
       : '';
 
     meta.innerHTML =
-      '<span class="badge badge-primary">' + result.similarity + '% match</span>' +
+      '<span class="badge badge-primary">' + result.score + '</span>' +
       '<span class="ml-2 text-muted small">' + new Date(result.timestamp * 1000).toLocaleString() + '</span>' +
       appTitle;
 
@@ -1265,6 +1450,7 @@ document.addEventListener('DOMContentLoaded', function() {
 {% endblock %}
 """,
         results=results,
+  metric_label=SEARCH_METRICS[metric],
     )
 
 
@@ -1460,6 +1646,7 @@ def api_status():
                 "last_mssim": capture_state["last_mssim"],
                 "recent_timings": list(capture_state["recent_timings"]),
                 "paused_until_ts": paused_until_ts,
+                "paused_indefinitely": bool(capture_state.get("paused_indefinitely")),
                 "is_paused": is_capture_paused(),
                 "stop_requested": bool(capture_state.get("stop_requested")),
             }
@@ -1479,6 +1666,13 @@ def api_capture_pause():
 
     paused_until_ts = set_capture_pause_for_seconds(minutes_int * 60)
     return jsonify({"ok": True, "paused_until_ts": paused_until_ts})
+
+
+@app.route("/api/capture/pause-forever", methods=["POST"])
+def api_capture_pause_forever():
+    """Pauses capture loop indefinitely until resumed."""
+    set_capture_pause_forever()
+    return jsonify({"ok": True, "paused_indefinitely": True})
 
 
 @app.route("/api/capture/resume", methods=["POST"])
@@ -1755,6 +1949,11 @@ if __name__ == "__main__":
     _recover_recent_corrupt_segments()
 
     print(f"Appdata folder: {appdata_folder}")
+
+    # Start global hotkeys when available.
+    hotkey_listener = start_hotkey_listener()
+    if hotkey_listener is None:
+      print("Global hotkeys unavailable (install/check pynput and desktop session).")
 
     # Start the thread to record screenshots
     t = Thread(target=record_screenshots_thread)

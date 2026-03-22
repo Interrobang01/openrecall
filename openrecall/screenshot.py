@@ -1,6 +1,7 @@
 import collections
 import logging
 import os
+import re
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,8 @@ from openrecall.config import (
     OPENRECALL_AV1_PRESET,
     OPENRECALL_AV1_PLAYBACK_FPS,
     OPENRECALL_AV1_SEGMENT_FRAMES,
+    OPENRECALL_BLACKLIST_WINDOWS,
+    OPENRECALL_BLACKLIST_WORDS,
     OPENRECALL_FFMPEG_BIN,
     OPENRECALL_SIMILARITY_FRAME_WIDTH,
     OPENRECALL_THUMB_MAX_DIMENSION,
@@ -28,9 +31,11 @@ from openrecall.database import insert_entry
 from openrecall.nlp import get_embedding
 from openrecall.ocr import extract_text_and_diagnostics_from_image
 from openrecall.utils import (
+    get_open_window_descriptors,
     get_active_app_name,
     get_active_window_title,
     is_user_active,
+    send_system_notification,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,20 +48,79 @@ capture_state: Dict[str, Any] = {
     "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
     "last_ocr_ab_compare": None,
     "paused_until_ts": 0,
+    "paused_indefinitely": False,
     "stop_requested": False,
 }
+
+
+def _parse_blacklist_terms(raw_terms: str) -> List[str]:
+    """Parses comma-separated blacklist terms into lowercase tokens."""
+    if not raw_terms:
+        return []
+    return [
+        term.strip().lower()
+        for term in raw_terms.split(",")
+        if term and term.strip()
+    ]
+
+
+WINDOW_BLACKLIST_TERMS = _parse_blacklist_terms(OPENRECALL_BLACKLIST_WINDOWS)
+OCR_BLACKLIST_TERMS = _parse_blacklist_terms(OPENRECALL_BLACKLIST_WORDS)
+
+
+def _find_blacklist_matches(haystack: str, blacklist_terms: List[str]) -> List[str]:
+    """Returns matched blacklist terms with word/phrase-aware case-insensitive matching."""
+    normalized_haystack = re.sub(r"\s+", " ", (haystack or "").lower()).strip()
+    if not normalized_haystack:
+        return []
+
+    matches: List[str] = []
+    for term in blacklist_terms:
+        normalized_term = re.sub(r"\s+", " ", (term or "").lower()).strip()
+        if not normalized_term:
+            continue
+
+        if " " in normalized_term:
+            if normalized_term in normalized_haystack:
+                matches.append(term)
+            continue
+
+        word_pattern = rf"(?<!\w){re.escape(normalized_term)}(?!\w)"
+        if re.search(word_pattern, normalized_haystack):
+            matches.append(term)
+
+    return matches
+
+
+def _notify_capture_pause(message: str) -> None:
+    """Sends best-effort system notification for capture pause/resume events."""
+    send_system_notification("OpenRecall", message)
 
 
 def set_capture_pause_for_seconds(pause_seconds: int) -> int:
     """Pauses capture loop for requested seconds and returns pause-until timestamp."""
     pause_until_ts = int(time.time()) + max(0, pause_seconds)
     capture_state["paused_until_ts"] = pause_until_ts
+    capture_state["paused_indefinitely"] = False
+    pause_minutes = max(1, int(round(max(0, pause_seconds) / 60.0)))
+    _notify_capture_pause(f"Capture paused for {pause_minutes} minute(s).")
     return pause_until_ts
+
+
+def set_capture_pause_forever() -> None:
+    """Pauses capture loop until explicitly resumed."""
+    capture_state["paused_until_ts"] = 0
+    capture_state["paused_indefinitely"] = True
+    _notify_capture_pause("Capture paused indefinitely.")
 
 
 def clear_capture_pause() -> None:
     """Resumes capture loop by clearing active pause."""
+    was_paused = is_capture_paused()
     capture_state["paused_until_ts"] = 0
+    capture_state["paused_indefinitely"] = False
+    if was_paused:
+        _notify_capture_pause("Capture resumed.")
 
 
 def request_capture_stop() -> None:
@@ -66,6 +130,8 @@ def request_capture_stop() -> None:
 
 def is_capture_paused(now_ts: Optional[int] = None) -> bool:
     """Returns whether capture is currently paused."""
+    if bool(capture_state.get("paused_indefinitely")):
+        return True
     now = int(time.time()) if now_ts is None else now_ts
     return now < int(capture_state.get("paused_until_ts") or 0)
 
@@ -379,6 +445,7 @@ def record_screenshots_thread() -> None:
     }
     segment_writers: Dict[int, MonitorAv1SegmentWriter] = {}
     _capture_print(f"screenshots_taken monitors={len(last_similarity_frames)}")
+    was_paused_last_iteration = False
 
     try:
         while True:
@@ -386,15 +453,37 @@ def record_screenshots_thread() -> None:
                 break
 
             now_ts = int(time.time())
-            if is_capture_paused(now_ts):
+            currently_paused = is_capture_paused(now_ts)
+            if was_paused_last_iteration and not currently_paused:
+                _notify_capture_pause("Capture resumed (pause timer ended).")
+
+            if currently_paused:
                 for monitor_id, writer in list(segment_writers.items()):
                     try:
                         writer.close()
                     except RuntimeError as exc:
                         logger.warning("Failed closing AV1 writer for monitor %s: %s", monitor_id, exc)
                     del segment_writers[monitor_id]
+                was_paused_last_iteration = True
                 time.sleep(1.0)
                 continue
+
+            was_paused_last_iteration = False
+
+            if WINDOW_BLACKLIST_TERMS:
+                open_window_descriptors = get_open_window_descriptors()
+                open_windows_haystack = "\n".join(open_window_descriptors)
+                matched_window_terms = _find_blacklist_matches(
+                    open_windows_haystack,
+                    WINDOW_BLACKLIST_TERMS,
+                )
+                if matched_window_terms:
+                    _capture_print(
+                        "capture_blocked_by_window_blacklist "
+                        f"terms={','.join(sorted(set(matched_window_terms)))}"
+                    )
+                    time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
+                    continue
 
             if not is_user_active():
                 time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
@@ -454,10 +543,33 @@ def record_screenshots_thread() -> None:
                     ocr_input = _resize_for_ocr(current_screenshot)
                     text, ocr_diagnostics = extract_text_and_diagnostics_from_image(ocr_input)
                     t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
+
+                    active_app_name: str = get_active_app_name() or "Unknown App"
+                    active_window_title: str = get_active_window_title() or "Unknown Title"
+
                     _capture_print(
                         f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
                         f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
                     )
+
+                    app_title_matches = _find_blacklist_matches(
+                        f"{active_app_name}\n{active_window_title}",
+                        WINDOW_BLACKLIST_TERMS,
+                    )
+                    if app_title_matches:
+                        _capture_print(
+                            "capture_blocked_by_active_window_blacklist "
+                            f"monitor={monitor_id} terms={','.join(sorted(set(app_title_matches)))}"
+                        )
+                        continue
+
+                    ocr_matches = _find_blacklist_matches(text, OCR_BLACKLIST_TERMS)
+                    if ocr_matches:
+                        _capture_print(
+                            "capture_blocked_by_ocr_blacklist "
+                            f"monitor={monitor_id} terms={','.join(sorted(set(ocr_matches)))}"
+                        )
+                        continue
 
                     t_embed_ms = 0.0
                     t_db_ms = 0.0
@@ -470,9 +582,6 @@ def record_screenshots_thread() -> None:
                             f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
                             f"embedding_ms={t_embed_ms:.1f}"
                         )
-
-                        active_app_name: str = get_active_app_name() or "Unknown App"
-                        active_window_title: str = get_active_window_title() or "Unknown Title"
 
                         _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
                         t_db_start = time.perf_counter()

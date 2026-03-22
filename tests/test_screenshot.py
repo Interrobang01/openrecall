@@ -122,5 +122,42 @@ class TestMonitorAv1SegmentWriterRotation(unittest.TestCase):
         self.assertEqual(pts_2, 1000)
 
 
+class TestCapturePauseAndBlacklist(unittest.TestCase):
+    def setUp(self):
+        screenshot.capture_state["paused_until_ts"] = 0
+        screenshot.capture_state["paused_indefinitely"] = False
+
+    def test_pause_forever_sets_state_and_is_paused(self):
+        with mock.patch.object(screenshot, "send_system_notification", return_value=True):
+            screenshot.set_capture_pause_forever()
+
+        self.assertTrue(screenshot.capture_state["paused_indefinitely"])
+        self.assertTrue(screenshot.is_capture_paused())
+
+    def test_clear_capture_pause_resets_forever_pause(self):
+        with mock.patch.object(screenshot, "send_system_notification", return_value=True):
+            screenshot.set_capture_pause_forever()
+            screenshot.clear_capture_pause()
+
+        self.assertFalse(screenshot.capture_state["paused_indefinitely"])
+        self.assertEqual(screenshot.capture_state["paused_until_ts"], 0)
+        self.assertFalse(screenshot.is_capture_paused())
+
+    def test_blacklist_match_is_case_insensitive(self):
+        terms = ["bitwarden", "incognito"]
+        matches = screenshot._find_blacklist_matches("BitWarden vault and Incognito tab", terms)
+        self.assertEqual(matches, ["bitwarden", "incognito"])
+
+    def test_blacklist_short_term_does_not_match_inside_word(self):
+        terms = ["tor"]
+        matches = screenshot._find_blacklist_matches("Mozilla Navigator window", terms)
+        self.assertEqual(matches, [])
+
+    def test_blacklist_phrase_matches_window_name(self):
+        terms = ["tor browser"]
+        matches = screenshot._find_blacklist_matches("Tor Browser - Private browsing", terms)
+        self.assertEqual(matches, ["tor browser"])
+
+
 if __name__ == "__main__":
     unittest.main()

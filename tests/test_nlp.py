@@ -1,6 +1,11 @@
 import pytest
 import numpy as np
-from openrecall.nlp import cosine_similarity
+from openrecall.nlp import (
+    cosine_similarity,
+    dot_product,
+    euclidean_distance,
+    manhattan_distance,
+)
 
 
 def test_cosine_similarity_identical_vectors():
@@ -39,3 +44,21 @@ def test_cosine_similarity_zero_vector():
     b = np.array([1, 0, 0])
     result = cosine_similarity(a, b)
     assert result == 0.0
+
+
+def test_dot_product():
+    a = np.array([1, 2, 3])
+    b = np.array([4, 5, 6])
+    assert dot_product(a, b) == 32.0
+
+
+def test_euclidean_distance():
+    a = np.array([1, 1, 1])
+    b = np.array([2, 3, 4])
+    assert euclidean_distance(a, b) == pytest.approx(np.sqrt(14.0))
+
+
+def test_manhattan_distance():
+    a = np.array([1, 1, 1])
+    b = np.array([2, 3, 4])
+    assert manhattan_distance(a, b) == 6.0

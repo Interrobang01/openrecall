@@ -2,7 +2,7 @@ import sys
 import datetime
 import re
 import shutil
-from typing import Optional
+from typing import List, Optional
 
 # Platform-specific imports with error handling
 try:
@@ -340,6 +340,196 @@ def get_active_window_title() -> str:
     else:
         print("Warning: Active window title retrieval not implemented for this platform.")
         raise NotImplementedError(f"Platform '{sys.platform}' not supported yet for get_active_window_title")
+
+
+def _extract_quoted_values(raw: str) -> List[str]:
+    """Extracts quoted string values from a property output line."""
+    return [value for value in re.findall(r'"([^"]*)"', raw) if value]
+
+
+def get_open_window_descriptors_osx() -> List[str]:
+    """Returns visible macOS window owner and title strings."""
+    if (
+        CGWindowListCopyWindowInfo is None
+        or kCGNullWindowID is None
+        or kCGWindowListOptionOnScreenOnly is None
+    ):
+        return []
+
+    descriptors: List[str] = []
+    try:
+        window_list = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+        )
+        for window in window_list:
+            owner_name = (window.get("kCGWindowOwnerName") or "").strip()
+            window_name = (window.get("kCGWindowName") or "").strip()
+            if owner_name:
+                descriptors.append(owner_name)
+            if window_name:
+                descriptors.append(window_name)
+    except Exception as exc:
+        print(f"Error getting macOS open windows: {exc}")
+    return descriptors
+
+
+def get_open_window_descriptors_windows() -> List[str]:
+    """Returns visible Windows window titles and process names."""
+    if not all([win32gui, win32process]):
+        return []
+
+    descriptors: List[str] = []
+
+    def _callback(hwnd, _lparam):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if win32gui.IsIconic(hwnd):
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if title:
+                descriptors.append(title)
+
+            if psutil is not None:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid:
+                    try:
+                        process_name = psutil.Process(pid).name()
+                        if process_name:
+                            descriptors.append(process_name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_callback, None)
+    except Exception as exc:
+        print(f"Error getting Windows open windows: {exc}")
+    return descriptors
+
+
+def get_open_window_descriptors_linux() -> List[str]:
+    """Returns visible Linux window titles/classes using xprop client list."""
+    if subprocess is None:
+        return []
+
+    try:
+        list_result = subprocess.run(
+            ["xprop", "-root", "_NET_CLIENT_LIST_STACKING"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if list_result.returncode != 0:
+            list_result = subprocess.run(
+                ["xprop", "-root", "_NET_CLIENT_LIST"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        if list_result.returncode != 0:
+            return []
+
+        window_ids = re.findall(r"0x[0-9a-fA-F]+", list_result.stdout)
+        descriptors: List[str] = []
+
+        for window_id in window_ids:
+            info_result = subprocess.run(
+                [
+                    "xprop",
+                    "-id",
+                    window_id,
+                    "_NET_WM_STATE",
+                    "WM_STATE",
+                    "WM_CLASS",
+                    "_NET_WM_NAME",
+                    "WM_NAME",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if info_result.returncode != 0:
+                continue
+
+            output_lower = info_result.stdout.lower()
+            if "_net_wm_state_hidden" in output_lower:
+                continue
+            if "window state: iconic" in output_lower:
+                continue
+
+            descriptors.extend(_extract_quoted_values(info_result.stdout))
+
+        return descriptors
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    except Exception as exc:
+        print(f"Error getting Linux open windows: {exc}")
+        return []
+
+
+def get_open_window_descriptors() -> List[str]:
+    """Gets visible window descriptors (titles/apps/classes) for the current platform."""
+    if sys.platform == "win32":
+        return get_open_window_descriptors_windows()
+    if sys.platform == "darwin":
+        return get_open_window_descriptors_osx()
+    if sys.platform.startswith("linux"):
+        return get_open_window_descriptors_linux()
+    return []
+
+
+def send_system_notification(title: str, message: str) -> bool:
+    """Shows a best-effort OS notification and returns whether dispatch succeeded."""
+    safe_title = (title or "OpenRecall").strip() or "OpenRecall"
+    safe_message = (message or "").strip() or "Notification"
+
+    try:
+        if sys.platform == "win32":
+            script = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+                "ContentType = WindowsRuntime] > $null; "
+                "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
+                "$xml.LoadXml(\"<toast><visual><binding template='ToastGeneric'>"
+                f"<text>{safe_title}</text><text>{safe_message}</text>"
+                "</binding></visual></toast>\"); "
+                "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+                "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::"
+                "CreateToastNotifier('OpenRecall'); $notifier.Show($toast);"
+            )
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-Command", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    f'display notification "{safe_message}" with title "{safe_title}"',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+
+        subprocess.Popen(
+            ["notify-send", safe_title, safe_message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def is_user_active_osx() -> bool:

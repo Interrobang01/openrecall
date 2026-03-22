@@ -169,3 +169,18 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     similarity = np.dot(a, b) / (norm_a * norm_b)
     # Clip values to handle potential floating-point inaccuracies slightly outside [-1, 1]
     return float(np.clip(similarity, -1.0, 1.0))
+
+
+def dot_product(a: np.ndarray, b: np.ndarray) -> float:
+    """Calculates the dot product between two vectors."""
+    return float(np.dot(a, b))
+
+
+def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Calculates Euclidean distance between two vectors."""
+    return float(np.linalg.norm(a - b))
+
+
+def manhattan_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Calculates Manhattan (L1) distance between two vectors."""
+    return float(np.sum(np.abs(a - b)))
