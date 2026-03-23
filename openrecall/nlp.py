@@ -1,5 +1,8 @@
 import logging
 import os
+import re
+import shutil
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -13,6 +16,15 @@ EMBEDDING_DIM: int = 384  # Dimension for all-MiniLM-L6-v2
 
 model: Optional[Any] = None
 _model_device: str = "auto"
+
+
+def _embed_sentences(embedding_model: Any, sentences: List[str]) -> np.ndarray:
+    """Embeds a list of sentences and returns their mean embedding vector."""
+    sentence_embeddings = list(embedding_model.embed(sentences, batch_size=min(16, len(sentences))))
+    if not sentence_embeddings:
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+
+    return np.mean(np.asarray(sentence_embeddings, dtype=np.float32), axis=0, dtype=np.float32)
 
 
 def _resolve_embedding_device() -> str:
@@ -67,14 +79,60 @@ def _build_fastembed_model(model_name: str, providers: List[str]) -> Any:
     """Builds a fastembed ONNX text embedding model with provider configuration."""
     from fastembed import TextEmbedding
 
-    try:
+    def _build_with_providers() -> Any:
         return TextEmbedding(model_name=model_name, providers=providers)
+
+    def _build_default() -> Any:
+        return TextEmbedding(model_name=model_name)
+
+    def _retry_after_cache_repair(error: Exception, use_default: bool) -> Any:
+        if _repair_fastembed_model_cache(error):
+            logger.warning("Detected broken fastembed cache for '%s'. Retrying download.", model_name)
+            if use_default:
+                return _build_default()
+            return _build_with_providers()
+        raise error
+
+    try:
+        return _build_with_providers()
     except TypeError:
         logger.warning(
             "Installed fastembed version does not support explicit providers. "
             "Using fastembed defaults."
         )
-        return TextEmbedding(model_name=model_name)
+        try:
+            return _build_default()
+        except Exception as exc:
+            return _retry_after_cache_repair(exc, use_default=True)
+    except Exception as exc:
+        return _retry_after_cache_repair(exc, use_default=False)
+
+
+def _repair_fastembed_model_cache(error: Exception) -> bool:
+    """Attempts to repair a corrupted fastembed model cache directory."""
+    message = str(error)
+    if "NO_SUCHFILE" not in message or "model.onnx" not in message:
+        return False
+
+    match = re.search(r"Load model from\s+([^\s]+model\.onnx)\s+failed", message)
+    if not match:
+        return False
+
+    model_path = Path(match.group(1))
+    if len(model_path.parents) < 3:
+        return False
+
+    cache_model_root = model_path.parents[2]
+    if not cache_model_root.exists() or not cache_model_root.is_dir():
+        return False
+
+    try:
+        shutil.rmtree(cache_model_root)
+        logger.warning("Removed corrupted fastembed cache directory: %s", cache_model_root)
+        return True
+    except OSError as exc:
+        logger.warning("Failed to remove corrupted fastembed cache '%s': %s", cache_model_root, exc)
+        return False
 
 
 def _get_model() -> Optional[Any]:
@@ -99,13 +157,27 @@ def _get_model() -> Optional[Any]:
             providers,
         )
     except Exception as e:
-        logger.error(
-            "Failed to load ONNX embedding model '%s' on '%s': %s",
-            model_name,
-            _model_device,
-            e,
-        )
-        model = None
+        logger.error("Failed to load ONNX embedding model '%s' on '%s': %s", model_name, _model_device, e)
+        if _model_device != "cpu":
+            try:
+                model = _build_fastembed_model(
+                    model_name=model_name,
+                    providers=["CPUExecutionProvider"],
+                )
+                _model_device = "cpu"
+                logger.warning(
+                    "Embedding model '%s' reinitialized on CPU after provider failure.",
+                    model_name,
+                )
+            except Exception as fallback_error:
+                logger.error(
+                    "Failed to load ONNX embedding model '%s' on CPU fallback: %s",
+                    model_name,
+                    fallback_error,
+                )
+                model = None
+        else:
+            model = None
     return model
 
 
@@ -132,6 +204,9 @@ def get_embedding(text: str) -> np.ndarray:
         or a zero vector if the input is empty, whitespace only, or the
         model failed to load. The array type is float32.
     """
+    global model
+    global _model_device
+
     embedding_model = _get_model()
     if embedding_model is None:
         logger.error("Embedding model is not loaded. Returning zero vector.")
@@ -149,19 +224,23 @@ def get_embedding(text: str) -> np.ndarray:
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
     try:
-        sentence_embeddings = list(
-            embedding_model.embed(sentences, batch_size=min(16, len(sentences)))
-        )
-        if not sentence_embeddings:
-            return np.zeros(EMBEDDING_DIM, dtype=np.float32)
-
-        # Calculate the mean embedding
-        mean_embedding = np.mean(
-            np.asarray(sentence_embeddings, dtype=np.float32), axis=0, dtype=np.float32
-        )
-        return mean_embedding
+        return _embed_sentences(embedding_model, sentences)
     except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
+        logger.error("Error generating embedding on '%s': %s", _model_device, e)
+
+        if _model_device != "cpu":
+            model_name = (os.getenv("OPENRECALL_EMBEDDING_MODEL") or MODEL_NAME).strip()
+            try:
+                logger.warning("Retrying embedding inference on CPUExecutionProvider.")
+                model = _build_fastembed_model(
+                    model_name=model_name,
+                    providers=["CPUExecutionProvider"],
+                )
+                _model_device = "cpu"
+                return _embed_sentences(model, sentences)
+            except Exception as fallback_error:
+                logger.error("CPU fallback embedding attempt failed: %s", fallback_error)
+
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
 
