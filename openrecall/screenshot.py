@@ -1,6 +1,9 @@
 import collections
+import ctypes
+import gc
 import logging
 import os
+import platform
 import re
 import subprocess
 import time
@@ -41,6 +44,25 @@ from openrecall.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Memory reclamation — return freed native pages to the OS after each cycle.
+# ---------------------------------------------------------------------------
+_libc: Optional[ctypes.CDLL] = None
+
+def _reclaim_native_memory() -> None:
+    """Run gc.collect and malloc_trim to return freed pages to the OS."""
+    global _libc
+    gc.collect()
+    if platform.system() != "Linux":
+        return
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Non-glibc system or unavailable — silently skip
+
 
 # Shared state updated by the capture loop; read by Flask routes.
 capture_state: Dict[str, Any] = {
@@ -662,6 +684,7 @@ def record_screenshots_thread() -> None:
                         f"captures_this_session={capture_state['captures_this_session']}"
                     )
 
+            _reclaim_native_memory()
             time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
     finally:
         for monitor_id, writer in segment_writers.items():

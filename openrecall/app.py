@@ -6,6 +6,8 @@ import sys
 from threading import Thread
 from typing import Dict, List, Optional, Tuple
 
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from jinja2 import BaseLoader

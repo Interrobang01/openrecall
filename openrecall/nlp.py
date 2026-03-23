@@ -80,10 +80,10 @@ def _build_fastembed_model(model_name: str, providers: List[str]) -> Any:
     from fastembed import TextEmbedding
 
     def _build_with_providers() -> Any:
-        return TextEmbedding(model_name=model_name, providers=providers)
+        return TextEmbedding(model_name=model_name, providers=providers, enable_cpu_mem_arena=False)
 
     def _build_default() -> Any:
-        return TextEmbedding(model_name=model_name)
+        return TextEmbedding(model_name=model_name, enable_cpu_mem_arena=False)
 
     def _retry_after_cache_repair(error: Exception, use_default: bool) -> Any:
         if _repair_fastembed_model_cache(error):
