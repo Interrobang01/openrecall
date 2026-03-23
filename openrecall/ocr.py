@@ -59,11 +59,11 @@ def _resolve_ocr_device() -> str:
 
 def _build_engine_config(provider_preference: str) -> EngineConfig:
     session_options = SessionOptions()
-    session_options.enable_cpu_mem_arena = True
+    session_options.enable_cpu_mem_arena = False
     session_options.execution_mode = ExecutionMode.ORT_SEQUENTIAL
     session_options.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
 
-    cpu_threads = _get_env_int("OPENRECALL_OCR_CPU_THREADS", default=-1, minimum=-1)
+    cpu_threads = _get_env_int("OPENRECALL_OCR_CPU_THREADS", default=2, minimum=-1)
     if cpu_threads > 0:
         session_options.intra_op_num_threads = cpu_threads
         session_options.inter_op_num_threads = 1

@@ -155,7 +155,7 @@ You can tune performance with environment variables:
 - `OPENRECALL_EMBEDDING_DEVICE` (embedding provider preference: `auto`/`cpu`/`cuda`/`coreml`; default `auto`)
 - `OPENRECALL_EMBEDDING_MODEL` (embedding model name; default `sentence-transformers/all-MiniLM-L6-v2`)
 - `OPENRECALL_OCR_DEVICE` (OCR provider preference: `auto`/`cpu`/`cuda`/`coreml`; default `auto`)
-- `OPENRECALL_OCR_CPU_THREADS` (override ONNX Runtime CPU threads; default auto)
+- `OPENRECALL_OCR_CPU_THREADS` (override ONNX Runtime CPU threads; default `2`)
 - `OPENRECALL_OCR_DET_ARCH` (default `db_mobilenet_v3_large`)
 - `OPENRECALL_OCR_RECO_ARCH` (default `crnn_mobilenet_v3_small` for speed/quality balance)
 - `OPENRECALL_STORAGE_BACKEND` (must be `av1_hybrid`)
