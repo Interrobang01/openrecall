@@ -150,7 +150,6 @@ You can tune performance with environment variables:
 
 - `OPENRECALL_CAPTURE_INTERVAL_SECONDS` (default `60.0`, min `1.0`)
 - `OPENRECALL_SIMILARITY_FRAME_WIDTH` (default `0` = disabled/original full-size behavior; min `0`)
-- `OPENRECALL_OCR_MAX_DIMENSION` (default `0` = disabled/original full-size behavior; min `0`)
 - `OPENRECALL_VERBOSE_CAPTURE_LOGS` (default `false`; set to `1`/`true` to enable stage/timing CLI prints)
 - `OPENRECALL_EMBEDDING_DEVICE` (embedding provider preference: `auto`/`cpu`/`cuda`/`coreml`; default `auto`)
 - `OPENRECALL_EMBEDDING_MODEL` (embedding model name; default `sentence-transformers/all-MiniLM-L6-v2`)
@@ -161,7 +160,7 @@ You can tune performance with environment variables:
 - `OPENRECALL_STORAGE_BACKEND` (must be `av1_hybrid`)
 - `OPENRECALL_FFMPEG_BIN` (default `ffmpeg`)
 - `OPENRECALL_AV1_CRF` (default `38`, lower = larger files / higher quality)
-- `OPENRECALL_AV1_PRESET` (default `8`, lower = slower encode / better compression)
+- `OPENRECALL_AV1_PRESET` (default `9`, lower = slower encode / better compression)
 - `OPENRECALL_AV1_THREADS` (default `0` = ffmpeg default; set `1..N` to cap encoder threads)
 - `OPENRECALL_AV1_SVTAV1_PARAMS` (default empty; raw `-svtav1-params` string, e.g. `lp=2:scd=0`)
 - `OPENRECALL_AV1_PLAYBACK_FPS` (default `2.0`, min `0.1`; encoded segment framerate used by video players)
@@ -182,8 +181,8 @@ On startup, OpenRecall checks ffmpeg capabilities and exits with a clear error i
 Examples:
 
 ```bash
-# Lower CPU usage (less frequent capture + smaller OCR input)
-OPENRECALL_CAPTURE_INTERVAL_SECONDS=5 OPENRECALL_OCR_MAX_DIMENSION=960 python3 -m openrecall.app
+# Lower CPU usage (less frequent capture)
+OPENRECALL_CAPTURE_INTERVAL_SECONDS=5 python3 -m openrecall.app
 
 # Force CPU explicitly
 OPENRECALL_EMBEDDING_DEVICE=cpu OPENRECALL_OCR_DEVICE=cpu python3 -m openrecall.app

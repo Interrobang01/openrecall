@@ -185,7 +185,7 @@ def _get_config_bool(name: str, default: bool) -> bool:
 OPENRECALL_STORAGE_BACKEND = _get_config_str("OPENRECALL_STORAGE_BACKEND", "av1_hybrid")
 OPENRECALL_FFMPEG_BIN = _get_config_str("OPENRECALL_FFMPEG_BIN", "ffmpeg")
 OPENRECALL_AV1_CRF = _get_config_int("OPENRECALL_AV1_CRF", default=38, minimum=0, maximum=63)
-OPENRECALL_AV1_PRESET = _get_config_str("OPENRECALL_AV1_PRESET", "8")
+OPENRECALL_AV1_PRESET = _get_config_str("OPENRECALL_AV1_PRESET", "9")
 OPENRECALL_AV1_THREADS = _get_config_int(
     "OPENRECALL_AV1_THREADS",
     default=0,
