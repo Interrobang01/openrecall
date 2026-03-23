@@ -91,11 +91,12 @@ db_path = os.path.join(appdata_folder, "recall.db")
 media_path = os.path.join(appdata_folder, "media")
 segments_path = os.path.join(media_path, "segments")
 thumbnails_path = os.path.join(media_path, "thumbnails")
+pending_frames_path = os.path.join(media_path, "pending_frames")
 
 # Backward-friendly alias used by older code paths, now points to thumbnails.
 screenshots_path = thumbnails_path
 
-for storage_dir in (appdata_folder, media_path, segments_path, thumbnails_path):
+for storage_dir in (appdata_folder, media_path, segments_path, thumbnails_path, pending_frames_path):
     os.makedirs(storage_dir, exist_ok=True)
 
 

@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -86,6 +88,45 @@ class TestCapturePauseApi(unittest.TestCase):
             status_after_resume = self.client.get("/api/status").get_json()
             self.assertFalse(status_after_resume.get("is_paused"))
             self.assertFalse(status_after_resume.get("paused_indefinitely"))
+
+
+class TestFrameEndpointPendingFallback(unittest.TestCase):
+    def setUp(self):
+        app.testing = True
+        self.client = app.test_client()
+
+    def test_serves_pending_frame_when_segment_not_finalized(self):
+        with tempfile.TemporaryDirectory() as tmp_segments, tempfile.TemporaryDirectory() as tmp_pending, mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ), mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ):
+            pending_filename = "123_m1.webp"
+            with open(os.path.join(tmp_pending, pending_filename), "wb") as pending_file:
+                pending_file.write(b"RIFFdummywebp")
+
+            response = self.client.get(
+                "/frame?segment=123_m1.mkv&pts_ms=0&thumb=123_m1.webp"
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, b"RIFFdummywebp")
+
+    def test_returns_not_found_when_segment_and_pending_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_segments, tempfile.TemporaryDirectory() as tmp_pending, mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ), mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ):
+            response = self.client.get(
+                "/frame?segment=999_m1.mkv&pts_ms=0&thumb=999_m1.webp"
+            )
+
+            self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import mss
@@ -29,6 +30,7 @@ from openrecall.config import (
     OPENRECALL_THUMB_QUALITY,
     OPENRECALL_VERBOSE_CAPTURE_LOGS,
     args,
+    pending_frames_path,
     segments_path,
     thumbnails_path,
 )
@@ -67,6 +69,7 @@ def _reclaim_native_memory() -> None:
 # Shared state updated by the capture loop; read by Flask routes.
 capture_state: Dict[str, Any] = {
     "last_capture_ts": 0,
+    "last_segment_ts": 0,
     "captures_this_session": 0,
     "last_mssim": None,
     "recent_timings": collections.deque(maxlen=10),  # list of timing dicts
@@ -321,6 +324,85 @@ class MonitorAv1SegmentWriter:
         return self.segment_filename, segment_pts_ms
 
 
+@dataclass
+class PendingSegmentFrame:
+    """Stores metadata for a lossless pending frame awaiting segment encode."""
+
+    thumb_filename: str
+    pending_filepath: str
+
+
+class MonitorPendingSegmentBuffer:
+    """Batches lossless monitor frames and encodes to AV1 at threshold."""
+
+    def __init__(self, monitor_id: int) -> None:
+        self.monitor_id = monitor_id
+        self.segment_filename: Optional[str] = None
+        self.segment_started_at_ms: Optional[int] = None
+        self._frames: List[PendingSegmentFrame] = []
+
+    def _reset(self) -> None:
+        self.segment_filename = None
+        self.segment_started_at_ms = None
+        self._frames = []
+
+    def _ensure_active_segment(self, capture_id_ms: int) -> None:
+        if self.segment_filename is not None and self.segment_started_at_ms is not None:
+            return
+
+        self.segment_started_at_ms = capture_id_ms
+        self.segment_filename = f"{capture_id_ms}_m{self.monitor_id}.mkv"
+
+    def add_frame(self, frame: np.ndarray, capture_id_ms: int, thumb_filename: str) -> Tuple[str, int, bool]:
+        """Adds one lossless frame and returns segment metadata + flush hint."""
+        self._ensure_active_segment(capture_id_ms)
+        if self.segment_filename is None:
+            raise RuntimeError("Pending segment filename is unavailable")
+
+        pending_filepath = os.path.join(pending_frames_path, thumb_filename)
+        _save_pending_fullres(frame, pending_filepath)
+
+        frame_index = len(self._frames)
+        segment_pts_ms = int(round(frame_index * (1000.0 / OPENRECALL_AV1_PLAYBACK_FPS)))
+        self._frames.append(
+            PendingSegmentFrame(
+                thumb_filename=thumb_filename,
+                pending_filepath=pending_filepath,
+            )
+        )
+
+        return self.segment_filename, segment_pts_ms, len(self._frames) >= AV1_SEGMENT_FRAMES
+
+    def flush_to_segment(self) -> Optional[str]:
+        """Encodes pending lossless frames into a single AV1 segment."""
+        if not self._frames:
+            self._reset()
+            return None
+
+        if self.segment_filename is None or self.segment_started_at_ms is None:
+            raise RuntimeError("Pending segment metadata is missing")
+
+        writer = MonitorAv1SegmentWriter(self.monitor_id)
+        segment_name = self.segment_filename
+
+        try:
+            for frame_data in self._frames:
+                with Image.open(frame_data.pending_filepath) as pending_image:
+                    frame_rgb = np.asarray(pending_image.convert("RGB"), dtype=np.uint8)
+                writer.write_frame(frame_rgb, self.segment_started_at_ms)
+        finally:
+            writer.close()
+
+        for frame_data in self._frames:
+            try:
+                os.remove(frame_data.pending_filepath)
+            except OSError:
+                pass
+
+        self._reset()
+        return segment_name
+
+
 def _save_thumbnail(image: np.ndarray, capture_id_ms: int, monitor_id: int) -> str:
     """Creates and stores a compressed lossy WebP thumbnail for a capture."""
     thumb_image = Image.fromarray(image)
@@ -346,6 +428,16 @@ def _save_thumbnail(image: np.ndarray, capture_id_ms: int, monitor_id: int) -> s
         lossless=False,
     )
     return thumb_filename
+
+
+def _save_pending_fullres(image: np.ndarray, pending_filepath: str) -> None:
+    """Stores lossless full-resolution frame for pending batch segment encoding."""
+    Image.fromarray(image).save(
+        pending_filepath,
+        format="WEBP",
+        method=6,
+        lossless=True,
+    )
 
 
 def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
@@ -473,9 +565,18 @@ def record_screenshots_thread() -> None:
         monitor_id: _prepare_similarity_frame(screenshot)
         for monitor_id, screenshot in initial_screenshots
     }
-    segment_writers: Dict[int, MonitorAv1SegmentWriter] = {}
+    pending_segment_buffers: Dict[int, MonitorPendingSegmentBuffer] = {}
     _capture_print(f"screenshots_taken monitors={len(last_similarity_frames)}")
     was_paused_last_iteration = False
+
+    def _flush_buffer_for_monitor(monitor_id: int) -> None:
+        buffer = pending_segment_buffers.get(monitor_id)
+        if buffer is None:
+            return
+
+        segment_name = buffer.flush_to_segment()
+        if segment_name:
+            capture_state["last_segment_ts"] = int(time.time())
 
     try:
         while True:
@@ -488,12 +589,12 @@ def record_screenshots_thread() -> None:
                 _notify_capture_pause("Capture resumed (pause timer ended).")
 
             if currently_paused:
-                for monitor_id, writer in list(segment_writers.items()):
+                for monitor_id, buffer in list(pending_segment_buffers.items()):
                     try:
-                        writer.close()
+                        _flush_buffer_for_monitor(monitor_id)
                     except RuntimeError as exc:
-                        logger.warning("Failed closing AV1 writer for monitor %s: %s", monitor_id, exc)
-                    del segment_writers[monitor_id]
+                        logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)
+                    del pending_segment_buffers[monitor_id]
                 was_paused_last_iteration = True
                 time.sleep(1.0)
                 continue
@@ -524,13 +625,13 @@ def record_screenshots_thread() -> None:
 
             current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
 
-            removed_monitors = set(segment_writers.keys()) - current_monitor_ids
+            removed_monitors = set(pending_segment_buffers.keys()) - current_monitor_ids
             for removed_monitor_id in removed_monitors:
                 try:
-                    segment_writers[removed_monitor_id].close()
+                    _flush_buffer_for_monitor(removed_monitor_id)
                 except RuntimeError as exc:
-                    logger.warning("Failed closing AV1 writer for monitor %s: %s", removed_monitor_id, exc)
-                del segment_writers[removed_monitor_id]
+                    logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", removed_monitor_id, exc)
+                del pending_segment_buffers[removed_monitor_id]
 
             # Ensure we have a last frame for each current screenshot.
             # This handles cases where monitor setup might change (though unlikely mid-run)
@@ -617,19 +718,27 @@ def record_screenshots_thread() -> None:
                         _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
                         t_encode_start = time.perf_counter()
 
-                        writer = segment_writers.setdefault(
-                            monitor_id,
-                            MonitorAv1SegmentWriter(monitor_id),
-                        )
-                        segment_filename, segment_pts_ms = writer.write_frame(
-                            current_screenshot,
-                            capture_id_ms,
-                        )
                         thumb_filename = _save_thumbnail(
                             current_screenshot,
                             capture_id_ms,
                             monitor_id,
                         )
+
+                        pending_buffer = pending_segment_buffers.setdefault(
+                            monitor_id,
+                            MonitorPendingSegmentBuffer(monitor_id),
+                        )
+                        segment_filename, segment_pts_ms, should_flush_segment = pending_buffer.add_frame(
+                            current_screenshot,
+                            capture_id_ms,
+                            thumb_filename,
+                        )
+
+                        if should_flush_segment:
+                            flushed_segment = pending_buffer.flush_to_segment()
+                            if flushed_segment:
+                                capture_state["last_segment_ts"] = int(time.time())
+
                         t_encode_ms = (time.perf_counter() - t_encode_start) * 1000
 
                         t_db_start = time.perf_counter()
@@ -687,8 +796,10 @@ def record_screenshots_thread() -> None:
             _reclaim_native_memory()
             time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
     finally:
-        for monitor_id, writer in segment_writers.items():
+        for monitor_id, pending_buffer in pending_segment_buffers.items():
             try:
-                writer.close()
+                flushed_segment = pending_buffer.flush_to_segment()
+                if flushed_segment:
+                    capture_state["last_segment_ts"] = int(time.time())
             except RuntimeError as exc:
-                logger.warning("Failed closing AV1 writer for monitor %s: %s", monitor_id, exc)
+                logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)

@@ -22,6 +22,7 @@ from openrecall.config import (
     config_file_path,
     get_runtime_config_values,
     media_path,
+    pending_frames_path,
     segments_path,
     thumbnails_path,
     write_runtime_config_file,
@@ -249,8 +250,13 @@ function pollStatus() {
       dot.title = 'Capture paused';
       dot.classList.remove('active');
     } else if (data.last_capture_ts) {
-      const ago = Math.round((Date.now()/1000) - data.last_capture_ts);
-      info.textContent = ago < 5 ? 'just now' : ago + 's ago';
+      const captureAgo = Math.round((Date.now()/1000) - data.last_capture_ts);
+      const captureText = captureAgo < 5 ? 'cap just now' : 'cap ' + captureAgo + 's';
+      const segmentAgo = Number(data.last_segment_ts || 0) > 0
+        ? Math.max(0, Math.round((Date.now()/1000) - Number(data.last_segment_ts || 0)))
+        : null;
+      const segmentText = segmentAgo === null ? 'seg —' : (segmentAgo < 5 ? 'seg just now' : 'seg ' + segmentAgo + 's');
+      info.textContent = captureText + ' · ' + segmentText;
       dot.title = 'Captures this session: ' + data.captures_this_session +
                   ' | MSSIM: ' + (data.last_mssim !== null ? data.last_mssim : '—');
     } else {
@@ -270,12 +276,14 @@ function loadStats() {
       return (b/1024).toFixed(0) + ' KB';
     }
     const badge = document.getElementById('storage-badge');
-    badge.textContent = fmt(data.segment_size_bytes + data.thumbnail_size_bytes + data.db_size_bytes) +
+    const totalSize = data.segment_size_bytes + data.thumbnail_size_bytes + data.pending_frame_size_bytes + data.db_size_bytes;
+    badge.textContent = fmt(totalSize) +
                         ' · ' + data.entry_count + ' entries';
     badge.title = 'AV1 segments: ' + fmt(data.segment_size_bytes) +
                   ' | Thumbnails: ' + fmt(data.thumbnail_size_bytes) +
+                  ' | Pending full-res: ' + fmt(data.pending_frame_size_bytes) +
                   ' | DB: ' + fmt(data.db_size_bytes);
-    if (data.segment_size_bytes + data.thumbnail_size_bytes + data.db_size_bytes > 5368709120) {
+    if (totalSize > 5368709120) {
       badge.classList.remove('badge-light');
       badge.classList.add('badge-warning');
     }
@@ -295,14 +303,14 @@ function loadRecoveryStatus() {
     if (quarantined > 0) {
       badge.classList.remove('badge-light');
       badge.classList.add('badge-warning');
-      badge.textContent = 'Recovered ' + quarantined + ' seg';
-      badge.title = 'Startup recovery quarantined ' + quarantined + ' segment(s), removed ' +
+      badge.textContent = 'Tail repaired ' + quarantined + ' seg';
+      badge.title = 'Startup tail check quarantined ' + quarantined + ' segment(s), removed ' +
                     (data.entries_removed || 0) + ' DB entries';
     } else {
       badge.classList.remove('badge-warning');
       badge.classList.add('badge-light');
-      badge.textContent = 'Recovery clean';
-      badge.title = 'Startup recovery found no unreadable recent segments';
+      badge.textContent = 'Tail check clean';
+      badge.title = 'Startup tail check found no unreadable recent segments';
     }
   }).catch(() => {});
 }
@@ -523,6 +531,14 @@ def _recover_recent_corrupt_segments() -> None:
       try:
         os.remove(thumb_path)
         removed_thumbs += 1
+      except OSError:
+        pass
+
+  for thumb_name in thumbs_to_delete:
+    pending_frame_path = os.path.join(pending_frames_path, thumb_name)
+    if os.path.exists(pending_frame_path):
+      try:
+        os.remove(pending_frame_path)
       except OSError:
         pass
 
@@ -1477,14 +1493,21 @@ def serve_frame():
 
     safe_pts_ms = max(0, pts_ms)
     segment_filepath = os.path.join(segments_path, safe_segment_name)
-    if not os.path.exists(segment_filepath):
-        return jsonify({"error": "Segment not found"}), 404
 
     safe_thumb_name = ""
     if thumb_name:
         candidate_thumb = os.path.basename(thumb_name)
         if candidate_thumb == thumb_name and candidate_thumb.endswith((".webp", ".jpg", ".jpeg")):
             safe_thumb_name = candidate_thumb
+
+    pending_frame_filepath = ""
+    if safe_thumb_name:
+      pending_frame_filepath = os.path.join(pending_frames_path, safe_thumb_name)
+
+    if not os.path.exists(segment_filepath):
+      if pending_frame_filepath and os.path.exists(pending_frame_filepath):
+        return send_from_directory(pending_frames_path, safe_thumb_name)
+      return jsonify({"error": "Segment not found"}), 404
 
     frame_index = None
     if safe_thumb_name:
@@ -1617,8 +1640,11 @@ def api_stats():
     av1_segment_files = glob.glob(os.path.join(segments_path, "*.mkv"))
     thumbnail_files = glob.glob(os.path.join(thumbnails_path, "*.webp"))
     thumbnail_files.extend(glob.glob(os.path.join(thumbnails_path, "*.jpg")))
+    pending_frame_files = glob.glob(os.path.join(pending_frames_path, "*.webp"))
+    pending_frame_files.extend(glob.glob(os.path.join(pending_frames_path, "*.png")))
     segment_size = sum(os.path.getsize(path) for path in av1_segment_files)
     thumbnail_size = sum(os.path.getsize(path) for path in thumbnail_files)
+    pending_frame_size = sum(os.path.getsize(path) for path in pending_frame_files)
     timestamps = get_timestamps()
     return jsonify(
       _json_safe(
@@ -1626,9 +1652,11 @@ def api_stats():
           "db_size_bytes": db_size,
           "segment_size_bytes": segment_size,
           "thumbnail_size_bytes": thumbnail_size,
+          "pending_frame_size_bytes": pending_frame_size,
           "entry_count": len(timestamps),
           "segment_count": len(av1_segment_files),
           "thumbnail_count": len(thumbnail_files),
+          "pending_frame_count": len(pending_frame_files),
           "oldest_timestamp": timestamps[-1] if timestamps else None,
           "newest_timestamp": timestamps[0] if timestamps else None,
         }
@@ -1644,6 +1672,7 @@ def api_status():
         _json_safe(
             {
                 "last_capture_ts": capture_state["last_capture_ts"],
+              "last_segment_ts": capture_state.get("last_segment_ts", 0),
                 "captures_this_session": capture_state["captures_this_session"],
                 "last_mssim": capture_state["last_mssim"],
                 "recent_timings": list(capture_state["recent_timings"]),

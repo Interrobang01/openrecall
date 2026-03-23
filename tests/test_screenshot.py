@@ -1,10 +1,12 @@
 import io
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 import numpy as np
 
-from openrecall.screenshot import MonitorAv1SegmentWriter
+from openrecall.screenshot import MonitorAv1SegmentWriter, MonitorPendingSegmentBuffer
 import openrecall.screenshot as screenshot
 
 
@@ -162,6 +164,75 @@ class TestMonitorAv1SegmentWriterCommand(unittest.TestCase):
         ffmpeg_cmd = popen_mock.call_args[0][0]
         self.assertNotIn("-threads", ffmpeg_cmd)
         self.assertNotIn("-svtav1-params", ffmpeg_cmd)
+
+
+class TestMonitorPendingSegmentBuffer(unittest.TestCase):
+    def test_add_frame_tracks_segment_and_flush_threshold(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            screenshot,
+            "pending_frames_path",
+            tmpdir,
+        ), mock.patch.object(
+            screenshot,
+            "AV1_SEGMENT_FRAMES",
+            2,
+        ), mock.patch.object(
+            screenshot,
+            "OPENRECALL_AV1_PLAYBACK_FPS",
+            2.0,
+        ):
+            buffer = MonitorPendingSegmentBuffer(monitor_id=3)
+
+            segment_1, pts_1, should_flush_1 = buffer.add_frame(frame, 1000, "1000_m3.webp")
+            segment_2, pts_2, should_flush_2 = buffer.add_frame(frame, 2000, "2000_m3.webp")
+
+            self.assertEqual(segment_1, "1000_m3.mkv")
+            self.assertEqual(segment_2, "1000_m3.mkv")
+            self.assertEqual(pts_1, 0)
+            self.assertEqual(pts_2, 500)
+            self.assertFalse(should_flush_1)
+            self.assertTrue(should_flush_2)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "1000_m3.webp")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "2000_m3.webp")))
+
+    def test_flush_to_segment_encodes_and_cleans_pending_frames(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        created_writers = []
+
+        class FakeBatchWriter:
+            def __init__(self, monitor_id: int) -> None:
+                self.monitor_id = monitor_id
+                self.write_count = 0
+                created_writers.append(self)
+
+            def write_frame(self, frame_to_write: np.ndarray, timestamp_ms: int):
+                self.write_count += 1
+                return f"{timestamp_ms}_m{self.monitor_id}.mkv", 0
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            screenshot,
+            "pending_frames_path",
+            tmpdir,
+        ), mock.patch.object(
+            screenshot,
+            "MonitorAv1SegmentWriter",
+            FakeBatchWriter,
+        ):
+            buffer = MonitorPendingSegmentBuffer(monitor_id=4)
+            buffer.add_frame(frame, 1111, "1111_m4.webp")
+            buffer.add_frame(frame, 2222, "2222_m4.webp")
+
+            segment_name = buffer.flush_to_segment()
+
+            self.assertEqual(segment_name, "1111_m4.mkv")
+            self.assertEqual(len(created_writers), 1)
+            self.assertEqual(created_writers[0].write_count, 2)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "1111_m4.webp")))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "2222_m4.webp")))
 
 
 class TestCapturePauseAndBlacklist(unittest.TestCase):
