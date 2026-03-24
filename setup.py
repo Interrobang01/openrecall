@@ -9,10 +9,12 @@ with io.open("README.md", "r", encoding="utf-8") as f:
 
 install_requires = [
     "Flask==3.1.3",
-    "numpy>=1.26,<3",
+    "numpy>=1.26,<2.0.0",
     "mss==10.1.0",
     "fastembed==0.7.4",
+    "onnxruntime>=1.23.0,<2",
     "onnxtr==0.8.1",
+    "opencv-python-headless>=4.10,<5",
     "Pillow>=11.3.0,<12",
     "pynput==1.8.1",
 ]
