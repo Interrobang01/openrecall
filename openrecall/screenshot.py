@@ -76,7 +76,28 @@ capture_state: Dict[str, Any] = {
     "paused_until_ts": 0,
     "paused_indefinitely": False,
     "stop_requested": False,
+    "status": "starting",
+    "status_updated_ts": int(time.time()),
+    "last_blocked_reason": "",
+    "last_blocked_terms": [],
+    "last_blocked_ts": 0,
 }
+
+
+def _set_capture_status(status: str) -> None:
+    """Updates shared capture state status marker with timestamp."""
+    capture_state["status"] = status
+    capture_state["status_updated_ts"] = int(time.time())
+
+
+def _set_capture_blocked_status(reason: str, terms: List[str]) -> None:
+    """Stores blacklist-blocked details and marks capture state as blocked."""
+    now_ts = int(time.time())
+    capture_state["status"] = reason
+    capture_state["status_updated_ts"] = now_ts
+    capture_state["last_blocked_reason"] = reason
+    capture_state["last_blocked_terms"] = sorted(set(terms))
+    capture_state["last_blocked_ts"] = now_ts
 
 
 def _parse_blacklist_terms(raw_terms: str) -> List[str]:
@@ -128,6 +149,7 @@ def set_capture_pause_for_seconds(pause_seconds: int) -> int:
     pause_until_ts = int(time.time()) + max(0, pause_seconds)
     capture_state["paused_until_ts"] = pause_until_ts
     capture_state["paused_indefinitely"] = False
+    _set_capture_status("paused")
     pause_minutes = max(1, int(round(max(0, pause_seconds) / 60.0)))
     _notify_capture_pause(f"Capture paused for {pause_minutes} minute(s).")
     return pause_until_ts
@@ -137,6 +159,7 @@ def set_capture_pause_forever() -> None:
     """Pauses capture loop until explicitly resumed."""
     capture_state["paused_until_ts"] = 0
     capture_state["paused_indefinitely"] = True
+    _set_capture_status("paused")
     _notify_capture_pause("Capture paused indefinitely.")
 
 
@@ -145,6 +168,7 @@ def clear_capture_pause() -> None:
     was_paused = is_capture_paused()
     capture_state["paused_until_ts"] = 0
     capture_state["paused_indefinitely"] = False
+    _set_capture_status("running")
     if was_paused:
         _notify_capture_pause("Capture resumed.")
 
@@ -152,6 +176,7 @@ def clear_capture_pause() -> None:
 def request_capture_stop() -> None:
     """Requests the capture loop to terminate gracefully."""
     capture_state["stop_requested"] = True
+    _set_capture_status("stopping")
 
 
 def is_capture_paused(now_ts: Optional[int] = None) -> bool:
@@ -566,6 +591,7 @@ def record_screenshots_thread() -> None:
         for monitor_id, screenshot in initial_screenshots
     }
     pending_segment_buffers: Dict[int, MonitorPendingSegmentBuffer] = {}
+    _set_capture_status("running")
     _capture_print(f"screenshots_taken monitors={len(last_similarity_frames)}")
     was_paused_last_iteration = False
 
@@ -589,8 +615,10 @@ def record_screenshots_thread() -> None:
                 _notify_capture_pause("Capture resumed (pause timer ended).")
 
             if currently_paused:
+                _set_capture_status("paused")
                 for monitor_id, buffer in list(pending_segment_buffers.items()):
                     try:
+                        _set_capture_status("encoding_pending")
                         _flush_buffer_for_monitor(monitor_id)
                     except RuntimeError as exc:
                         logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)
@@ -609,6 +637,10 @@ def record_screenshots_thread() -> None:
                     WINDOW_BLACKLIST_TERMS,
                 )
                 if matched_window_terms:
+                    _set_capture_blocked_status(
+                        "blocked_window_blacklist",
+                        matched_window_terms,
+                    )
                     _capture_print(
                         "capture_blocked_by_window_blacklist "
                         f"terms={','.join(sorted(set(matched_window_terms)))}"
@@ -617,8 +649,11 @@ def record_screenshots_thread() -> None:
                     continue
 
             if not is_user_active():
+                _set_capture_status("user_inactive")
                 time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
                 continue
+
+            _set_capture_status("capturing")
 
             current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
             _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
@@ -628,6 +663,7 @@ def record_screenshots_thread() -> None:
             removed_monitors = set(pending_segment_buffers.keys()) - current_monitor_ids
             for removed_monitor_id in removed_monitors:
                 try:
+                    _set_capture_status("encoding_pending")
                     _flush_buffer_for_monitor(removed_monitor_id)
                 except RuntimeError as exc:
                     logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", removed_monitor_id, exc)
@@ -645,6 +681,7 @@ def record_screenshots_thread() -> None:
                     monitor_id: _prepare_similarity_frame(screenshot)
                     for monitor_id, screenshot in current_screenshots
                 }
+                _set_capture_status("monitor_layout_changed")
                 time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
                 continue
 
@@ -688,6 +725,10 @@ def record_screenshots_thread() -> None:
                         WINDOW_BLACKLIST_TERMS,
                     )
                     if app_title_matches:
+                        _set_capture_blocked_status(
+                            "blocked_active_window_blacklist",
+                            app_title_matches,
+                        )
                         _capture_print(
                             "capture_blocked_by_active_window_blacklist "
                             f"monitor={monitor_id} terms={','.join(sorted(set(app_title_matches)))}"
@@ -696,6 +737,10 @@ def record_screenshots_thread() -> None:
 
                     ocr_matches = _find_blacklist_matches(text, OCR_BLACKLIST_TERMS)
                     if ocr_matches:
+                        _set_capture_blocked_status(
+                            "blocked_ocr_blacklist",
+                            ocr_matches,
+                        )
                         _capture_print(
                             "capture_blocked_by_ocr_blacklist "
                             f"monitor={monitor_id} terms={','.join(sorted(set(ocr_matches)))}"
@@ -735,6 +780,7 @@ def record_screenshots_thread() -> None:
                         )
 
                         if should_flush_segment:
+                            _set_capture_status("encoding_pending")
                             flushed_segment = pending_buffer.flush_to_segment()
                             if flushed_segment:
                                 capture_state["last_segment_ts"] = int(time.time())
@@ -783,6 +829,7 @@ def record_screenshots_thread() -> None:
                     capture_state["recent_timings"].append(timing)
                     capture_state["last_capture_ts"] = timestamp
                     capture_state["captures_this_session"] += 1
+                    _set_capture_status("captured")
                     _capture_print(
                         "metrics "
                         f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
@@ -794,12 +841,15 @@ def record_screenshots_thread() -> None:
                     )
 
             _reclaim_native_memory()
+            _set_capture_status("running")
             time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
     finally:
         for monitor_id, pending_buffer in pending_segment_buffers.items():
             try:
+                _set_capture_status("encoding_pending")
                 flushed_segment = pending_buffer.flush_to_segment()
                 if flushed_segment:
                     capture_state["last_segment_ts"] = int(time.time())
             except RuntimeError as exc:
                 logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)
+        _set_capture_status("stopped")

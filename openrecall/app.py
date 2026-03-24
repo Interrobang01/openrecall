@@ -2673,6 +2673,11 @@ def api_status():
                 "paused_indefinitely": bool(capture_state.get("paused_indefinitely")),
                 "is_paused": is_capture_paused(),
                 "stop_requested": bool(capture_state.get("stop_requested")),
+                "status": str(capture_state.get("status") or "unknown"),
+                "status_updated_ts": int(capture_state.get("status_updated_ts") or 0),
+                "last_blocked_reason": str(capture_state.get("last_blocked_reason") or ""),
+                "last_blocked_terms": list(capture_state.get("last_blocked_terms") or []),
+                "last_blocked_ts": int(capture_state.get("last_blocked_ts") or 0),
             }
         )
     )
