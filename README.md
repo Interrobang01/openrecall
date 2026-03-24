@@ -47,7 +47,12 @@ OpenRecall offers several key advantages over closed-source alternatives:
 
 - **Semantic and expression search**
   - Local OCR + local embeddings for private semantic search.
+  - Advanced search dropdown in the top bar keeps the search field compact while exposing all filters.
   - Multiple search metrics: `cosine`, `dot`, `euclidean`, `manhattan`.
+  - Date-range filter defaults to first/last recorded screenshot timestamps.
+  - Focused-window substring filter (`app`/window title), plus monitor filter.
+  - Proximity dedup filter compresses near-duplicate runs by keeping top-ranked representatives.
+  - Proximity slider uses a logarithmic scale from `1s` up to `min(1 year, half of dataset span)`.
   - Supports quoted exact phrases and embedding expressions like `(queen) - (king) + (woman)`.
 
 - **Capture controls and hotkeys**

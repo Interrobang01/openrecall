@@ -1,4 +1,5 @@
 import glob
+import datetime
 import os
 import shutil
 import subprocess
@@ -82,6 +83,10 @@ SEARCH_METRICS = {
   "euclidean": "Euclidean distance",
   "manhattan": "Manhattan distance",
 }
+
+PROXIMITY_MIN_SECONDS = 1
+PROXIMITY_MAX_SECONDS_FALLBACK = 31536000
+PROXIMITY_SLIDER_STEPS = 1000
 
 
 def _json_safe(value):
@@ -185,6 +190,22 @@ base_template = """
 
     /* Metrics table */
     .metrics-table td, .metrics-table th { font-size: 0.82rem; }
+
+    .search-advanced-container {
+      position: relative;
+      min-width: 220px;
+    }
+    .search-advanced-panel {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 1050;
+      width: min(680px, 92vw);
+      display: none;
+    }
+    .search-advanced-panel.open {
+      display: block;
+    }
   </style>
 </head>
 <body>
@@ -204,18 +225,69 @@ base_template = """
 
     <span id="capture-action-feedback" class="text-muted mr-2" style="font-size:0.74rem; white-space:nowrap;"></span>
 
-    <!-- Search bar -->
-    <form class="form-inline flex-grow-1 d-flex" action="/search" method="get" style="min-width:200px;">
-      <input class="form-control flex-grow-1 mr-1" type="search" name="q" placeholder="Search" aria-label="Search"
-             value="{{ request.args.get('q', '') }}">
-      <select class="form-control mr-1" name="metric" aria-label="Search metric" style="max-width:200px;">
-        <option value="cosine" {% if request.args.get('metric', 'cosine') == 'cosine' %}selected{% endif %}>Cosine</option>
-        <option value="dot" {% if request.args.get('metric') == 'dot' %}selected{% endif %}>Dot product</option>
-        <option value="euclidean" {% if request.args.get('metric') == 'euclidean' %}selected{% endif %}>Euclidean distance</option>
-        <option value="manhattan" {% if request.args.get('metric') == 'manhattan' %}selected{% endif %}>Manhattan distance</option>
-      </select>
-      <button class="btn btn-outline-secondary" type="submit"><i class="bi bi-search"></i></button>
-    </form>
+    <!-- Search bar + advanced filters -->
+    <div class="search-advanced-container flex-grow-1">
+      <form id="topSearchForm" class="d-flex" action="/search" method="get" style="min-width:200px;">
+        <input id="topSearchInput" class="form-control flex-grow-1 mr-1" type="search" name="q" placeholder="Search" aria-label="Search"
+               value="{{ search_q }}" autocomplete="off">
+        <button id="topSearchFiltersBtn" type="button" class="btn btn-outline-secondary mr-1" title="Search filters">
+          <i class="bi bi-sliders"></i>
+        </button>
+        <button class="btn btn-outline-secondary" type="submit"><i class="bi bi-search"></i></button>
+
+        <div id="topSearchAdvancedPanel" class="search-advanced-panel card shadow-sm">
+          <div class="card-body py-2">
+            <div class="form-row">
+              <div class="col-md-4 mb-2">
+                <label class="small text-muted mb-1">Metric</label>
+                <select class="form-control form-control-sm" name="metric" aria-label="Search metric">
+                  <option value="cosine" {% if search_metric == 'cosine' %}selected{% endif %}>Cosine</option>
+                  <option value="dot" {% if search_metric == 'dot' %}selected{% endif %}>Dot product</option>
+                  <option value="euclidean" {% if search_metric == 'euclidean' %}selected{% endif %}>Euclidean distance</option>
+                  <option value="manhattan" {% if search_metric == 'manhattan' %}selected{% endif %}>Manhattan distance</option>
+                </select>
+              </div>
+              <div class="col-md-4 mb-2">
+                <label class="small text-muted mb-1">From</label>
+                <input type="datetime-local" class="form-control form-control-sm" name="date_from" value="{{ search_date_from }}">
+              </div>
+              <div class="col-md-4 mb-2">
+                <label class="small text-muted mb-1">To</label>
+                <input type="datetime-local" class="form-control form-control-sm" name="date_to" value="{{ search_date_to }}">
+              </div>
+              <div class="col-md-6 mb-2">
+                <label class="small text-muted mb-1">Focused window contains</label>
+                <input class="form-control form-control-sm" type="text" name="window_filter" value="{{ search_window_filter }}" placeholder="substring">
+              </div>
+              <div class="col-md-3 mb-2">
+                <label class="small text-muted mb-1">Monitor</label>
+                <select class="form-control form-control-sm" name="monitor_id">
+                  <option value="" {% if not search_monitor_filter %}selected{% endif %}>All monitors</option>
+                  {% for monitor_id in search_monitor_options %}
+                  <option value="{{ monitor_id }}" {% if search_monitor_filter == (monitor_id|string) %}selected{% endif %}>Monitor {{ monitor_id }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="col-md-3 mb-2 d-flex align-items-end">
+                <a class="btn btn-sm btn-outline-secondary w-100" href="/search?q={{ search_q|urlencode }}">Reset filters</a>
+              </div>
+              <div class="col-12 mb-1">
+                <label class="small text-muted mb-1 d-flex justify-content-between">
+                  <span>Proximity</span>
+                  <span id="topSearchProximityValue" class="font-weight-bold">{{ search_proximity_human }}</span>
+                </label>
+                <input id="topSearchProximityLevel" type="range" class="custom-range"
+                       min="0" max="{{ search_proximity_slider_steps }}" step="1"
+                       value="{{ search_proximity_level }}" data-max-seconds="{{ search_proximity_max_seconds }}">
+                <input id="topSearchProximitySeconds" type="hidden" name="proximity_seconds" value="{{ search_proximity_seconds }}">
+                <input type="hidden" name="proximity_level" value="{{ search_proximity_level }}" id="topSearchProximityLevelHidden">
+                <div class="small text-muted">Log scale: 1s → {{ search_proximity_max_human }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
 
     <!-- Storage stats -->
     <span id="storage-badge" class="badge badge-light border text-muted" style="font-size:0.75rem; white-space:nowrap;" title="Storage usage"></span>
@@ -355,6 +427,117 @@ document.getElementById('open-folder-btn').addEventListener('click', function() 
   }).catch(() => {});
 });
 
+function proximitySecondsFromLevel(level, maxSeconds, sliderMax) {
+  const safeMaxSeconds = Math.max(1, Number(maxSeconds || 1));
+  const safeSliderMax = Math.max(1, Number(sliderMax || 1000));
+  const safeLevel = Math.max(0, Math.min(safeSliderMax, Number(level || 0)));
+  if (safeMaxSeconds <= 1) {
+    return 1;
+  }
+  const exponent = safeLevel / safeSliderMax;
+  return Math.max(1, Math.min(safeMaxSeconds, Math.round(Math.exp(Math.log(safeMaxSeconds) * exponent))));
+}
+
+function formatProximitySeconds(seconds) {
+  const value = Math.max(1, Number(seconds || 1));
+  if (value < 60) {
+    return value + 's';
+  }
+  if (value < 3600) {
+    if (value % 60 === 0) {
+      return (value / 60) + 'm';
+    }
+    return (value / 60).toFixed(1) + 'm';
+  }
+  if (value % 3600 === 0) {
+    return (value / 3600) + 'h';
+  }
+  if (value < 86400) {
+    return (value / 3600).toFixed(1) + 'h';
+  }
+  if (value % 86400 === 0) {
+    return (value / 86400) + 'd';
+  }
+  return (value / 86400).toFixed(1) + 'd';
+}
+
+const topSearchForm = document.getElementById('topSearchForm');
+const topSearchInput = document.getElementById('topSearchInput');
+const topSearchFiltersBtn = document.getElementById('topSearchFiltersBtn');
+const topSearchAdvancedPanel = document.getElementById('topSearchAdvancedPanel');
+const topSearchProximityLevel = document.getElementById('topSearchProximityLevel');
+const topSearchProximityValue = document.getElementById('topSearchProximityValue');
+const topSearchProximitySeconds = document.getElementById('topSearchProximitySeconds');
+const topSearchProximityLevelHidden = document.getElementById('topSearchProximityLevelHidden');
+
+function openTopSearchAdvancedPanel() {
+  if (topSearchAdvancedPanel) {
+    topSearchAdvancedPanel.classList.add('open');
+  }
+}
+
+function closeTopSearchAdvancedPanel() {
+  if (topSearchAdvancedPanel) {
+    topSearchAdvancedPanel.classList.remove('open');
+  }
+}
+
+function syncTopSearchProximityFields() {
+  if (!topSearchProximityLevel || !topSearchProximitySeconds || !topSearchProximityValue) {
+    return;
+  }
+  const maxSeconds = Number(topSearchProximityLevel.dataset.maxSeconds || 1);
+  const sliderMax = Number(topSearchProximityLevel.max || 1000);
+  const level = Number(topSearchProximityLevel.value || 0);
+  const seconds = proximitySecondsFromLevel(level, maxSeconds, sliderMax);
+
+  topSearchProximitySeconds.value = String(seconds);
+  topSearchProximityValue.textContent = formatProximitySeconds(seconds);
+  if (topSearchProximityLevelHidden) {
+    topSearchProximityLevelHidden.value = String(level);
+  }
+}
+
+if (topSearchInput) {
+  topSearchInput.addEventListener('focus', openTopSearchAdvancedPanel);
+  topSearchInput.addEventListener('click', openTopSearchAdvancedPanel);
+}
+
+if (topSearchFiltersBtn) {
+  topSearchFiltersBtn.addEventListener('click', function() {
+    if (!topSearchAdvancedPanel) {
+      return;
+    }
+    const isOpen = topSearchAdvancedPanel.classList.contains('open');
+    if (isOpen) {
+      closeTopSearchAdvancedPanel();
+    } else {
+      openTopSearchAdvancedPanel();
+    }
+  });
+}
+
+if (topSearchProximityLevel) {
+  topSearchProximityLevel.addEventListener('input', syncTopSearchProximityFields);
+  syncTopSearchProximityFields();
+}
+
+if (topSearchForm) {
+  topSearchForm.addEventListener('submit', function() {
+    syncTopSearchProximityFields();
+    closeTopSearchAdvancedPanel();
+  });
+}
+
+document.addEventListener('click', function(event) {
+  if (!topSearchForm || !topSearchAdvancedPanel) {
+    return;
+  }
+  if (!topSearchForm.contains(event.target)) {
+    closeTopSearchAdvancedPanel();
+  }
+});
+
 function postJson(url, payload) {
   return fetch(url, {
     method: 'POST',
@@ -458,6 +641,39 @@ class StringLoader(BaseLoader):
 
 
 app.jinja_env.loader = StringLoader()
+
+
+@app.context_processor
+def inject_search_form_defaults() -> Dict[str, object]:
+    """Provides default search form values for navbar advanced filters."""
+    raw_metric = (request.args.get("metric") or "cosine").strip().lower()
+    metric = raw_metric if raw_metric in SEARCH_METRICS else "cosine"
+
+    raw_proximity_seconds = request.args.get("proximity_seconds", type=int)
+    proximity_seconds = max(
+      PROXIMITY_MIN_SECONDS,
+      raw_proximity_seconds if raw_proximity_seconds is not None else PROXIMITY_MIN_SECONDS,
+    )
+
+    raw_proximity_level = request.args.get("proximity_level", type=int)
+    proximity_level = raw_proximity_level if raw_proximity_level is not None else 0
+    proximity_level = max(0, min(PROXIMITY_SLIDER_STEPS, proximity_level))
+
+    return {
+      "search_q": (request.args.get("q") or "").strip(),
+      "search_metric": metric,
+      "search_date_from": (request.args.get("date_from") or "").strip(),
+      "search_date_to": (request.args.get("date_to") or "").strip(),
+      "search_window_filter": (request.args.get("window_filter") or "").strip(),
+      "search_monitor_filter": (request.args.get("monitor_id") or "").strip(),
+      "search_monitor_options": [],
+      "search_proximity_seconds": proximity_seconds,
+      "search_proximity_level": proximity_level,
+      "search_proximity_human": _format_proximity_human(proximity_seconds),
+      "search_proximity_max_seconds": PROXIMITY_MAX_SECONDS_FALLBACK,
+      "search_proximity_max_human": _format_proximity_human(PROXIMITY_MAX_SECONDS_FALLBACK),
+      "search_proximity_slider_steps": PROXIMITY_SLIDER_STEPS,
+    }
 
 
 def _segment_recency_key(segment_filepath: str) -> int:
@@ -779,6 +995,125 @@ def _format_search_score(metric: str, score: float, used_expression: bool) -> st
     if used_expression:
       return f"{score:.4f}"
     return "—"
+
+
+def _timestamp_to_datetime_local_input(timestamp: int) -> str:
+    """Formats UNIX timestamp to YYYY-MM-DDTHH:MM in local time for input fields."""
+    local_dt = datetime.datetime.fromtimestamp(int(timestamp))
+    return local_dt.strftime("%Y-%m-%dT%H:%M")
+
+
+def _parse_datetime_local_to_timestamp(raw_value: str) -> Optional[int]:
+    """Parses datetime-local value (YYYY-MM-DDTHH:MM) to local UNIX timestamp."""
+    value = (raw_value or "").strip()
+    if not value:
+      return None
+
+    try:
+      parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+      return None
+
+    return int(parsed.timestamp())
+
+
+def _entry_matches_window_filter(entry_app: str, entry_title: str, window_filter: str) -> bool:
+    """Returns whether focused window metadata contains window_filter substring."""
+    needle = (window_filter or "").strip().lower()
+    if not needle:
+      return True
+
+    app_text = (entry_app or "").lower()
+    title_text = (entry_title or "").lower()
+    combined_text = (f"{entry_app or ''} {entry_title or ''}").lower()
+    return needle in app_text or needle in title_text or needle in combined_text
+
+
+def _entry_matches_monitor_filter(entry_monitor_id: int, monitor_filter: Optional[int]) -> bool:
+    """Returns whether entry monitor matches requested monitor filter."""
+    if monitor_filter is None:
+      return True
+    return int(entry_monitor_id) == int(monitor_filter)
+
+
+def _entry_in_date_range(entry_timestamp: int, from_ts: Optional[int], to_ts: Optional[int]) -> bool:
+    """Returns whether timestamp falls inside inclusive [from_ts, to_ts] bounds."""
+    if from_ts is not None and entry_timestamp < from_ts:
+      return False
+    if to_ts is not None and entry_timestamp > to_ts:
+      return False
+    return True
+
+
+def _apply_proximity_dedup(results: List[dict], proximity_seconds: int) -> List[dict]:
+    """Greedy dedupe by timestamp proximity, preserving top-ranked representatives."""
+    if proximity_seconds <= 0:
+      return results
+
+    kept: List[dict] = []
+    kept_timestamps: List[int] = []
+    for result in results:
+      timestamp = int(result.get("timestamp") or 0)
+      is_blocked = any(abs(timestamp - existing_ts) < proximity_seconds for existing_ts in kept_timestamps)
+      if is_blocked:
+        continue
+      kept.append(result)
+      kept_timestamps.append(timestamp)
+    return kept
+
+
+def _format_proximity_human(seconds: int) -> str:
+    """Formats proximity seconds into compact human-readable text."""
+    if seconds <= 0:
+      return "Off"
+    if seconds < 60:
+      return f"{seconds}s"
+    if seconds < 3600:
+      minutes = seconds / 60.0
+      if seconds % 60 == 0:
+        return f"{int(minutes)}m"
+      return f"{minutes:.1f}m"
+
+    hours = seconds / 3600.0
+    if seconds % 3600 == 0:
+      return f"{int(hours)}h"
+    return f"{hours:.1f}h"
+
+
+def _resolve_proximity_max_seconds(oldest_ts: Optional[int], newest_ts: Optional[int]) -> int:
+    """Returns max proximity seconds for slider end.
+
+    Uses half of available recording span when possible, capped at one year.
+    """
+    if oldest_ts is None or newest_ts is None or newest_ts <= oldest_ts:
+      return PROXIMITY_MAX_SECONDS_FALLBACK
+
+    half_span = max(PROXIMITY_MIN_SECONDS, (int(newest_ts) - int(oldest_ts)) // 2)
+    return min(PROXIMITY_MAX_SECONDS_FALLBACK, half_span)
+
+
+def _proximity_seconds_to_level(seconds: int, max_seconds: int) -> int:
+    """Maps proximity seconds to logarithmic slider level."""
+    safe_max = max(PROXIMITY_MIN_SECONDS, int(max_seconds))
+    safe_seconds = max(PROXIMITY_MIN_SECONDS, min(int(seconds), safe_max))
+    if safe_max <= PROXIMITY_MIN_SECONDS:
+      return 0
+
+    ratio = np.log(float(safe_seconds)) / np.log(float(safe_max))
+    level = int(round(ratio * PROXIMITY_SLIDER_STEPS))
+    return max(0, min(PROXIMITY_SLIDER_STEPS, level))
+
+
+def _proximity_level_to_seconds(level: int, max_seconds: int) -> int:
+    """Maps logarithmic slider level to proximity seconds."""
+    safe_max = max(PROXIMITY_MIN_SECONDS, int(max_seconds))
+    safe_level = max(0, min(PROXIMITY_SLIDER_STEPS, int(level)))
+    if safe_max <= PROXIMITY_MIN_SECONDS:
+      return PROXIMITY_MIN_SECONDS
+
+    exponent = float(safe_level) / float(PROXIMITY_SLIDER_STEPS)
+    seconds = int(round(float(safe_max) ** exponent))
+    return max(PROXIMITY_MIN_SECONDS, min(safe_max, seconds))
 
 
 @app.route("/")
@@ -1398,7 +1733,44 @@ applyFilter();
 def search():
     q = (request.args.get("q") or "").strip()
     metric = _resolve_search_metric(request.args.get("metric") or "cosine")
+    raw_monitor_filter = (request.args.get("monitor_id") or "").strip()
+    window_filter = (request.args.get("window_filter") or "").strip()
+
     entries = get_all_entries()
+    oldest_ts = int(entries[-1].timestamp) if entries else None
+    newest_ts = int(entries[0].timestamp) if entries else None
+
+    date_from_raw = (request.args.get("date_from") or "").strip()
+    date_to_raw = (request.args.get("date_to") or "").strip()
+    if not date_from_raw and oldest_ts is not None:
+      date_from_raw = _timestamp_to_datetime_local_input(oldest_ts)
+    if not date_to_raw and newest_ts is not None:
+      date_to_raw = _timestamp_to_datetime_local_input(newest_ts)
+
+    from_ts = _parse_datetime_local_to_timestamp(date_from_raw)
+    to_ts = _parse_datetime_local_to_timestamp(date_to_raw)
+    if from_ts is not None and to_ts is not None and from_ts > to_ts:
+      from_ts, to_ts = to_ts, from_ts
+
+    monitor_filter: Optional[int] = None
+    if raw_monitor_filter:
+      try:
+        monitor_filter = int(raw_monitor_filter)
+      except ValueError:
+        monitor_filter = None
+
+    proximity_max_seconds = _resolve_proximity_max_seconds(oldest_ts, newest_ts)
+    proximity_level = request.args.get("proximity_level", type=int)
+    proximity_seconds = request.args.get("proximity_seconds", type=int)
+    if proximity_level is not None:
+      proximity_seconds = _proximity_level_to_seconds(proximity_level, proximity_max_seconds)
+    elif proximity_seconds is None:
+      proximity_seconds = PROXIMITY_MIN_SECONDS
+    proximity_seconds = max(PROXIMITY_MIN_SECONDS, min(proximity_max_seconds, int(proximity_seconds)))
+    proximity_level = _proximity_seconds_to_level(proximity_seconds, proximity_max_seconds)
+
+    monitor_options = sorted({int(entry.monitor_id) for entry in entries})
+
     semantic_query, exact_phrases = _parse_search_query(q)
     expression_terms = _parse_embedding_expression(q)
 
@@ -1406,6 +1778,9 @@ def search():
         index
         for index, entry in enumerate(entries)
         if _entry_matches_exact_phrases(entry.text or "", exact_phrases)
+        and _entry_in_date_range(int(entry.timestamp), from_ts, to_ts)
+        and _entry_matches_window_filter(entry.app or "", entry.title or "", window_filter)
+        and _entry_matches_monitor_filter(int(entry.monitor_id), monitor_filter)
     ]
 
     results = []
@@ -1467,6 +1842,9 @@ def search():
 
         results.sort(key=lambda item: item["timestamp"], reverse=True)
 
+    total_before_proximity = len(results)
+    results = _apply_proximity_dedup(results, proximity_seconds)
+
     return render_template_string(
         """
 {% extends "base_template" %}
@@ -1475,7 +1853,7 @@ def search():
   {% if not results %}
     <div class="alert alert-info">No results.</div>
   {% else %}
-  <p class="text-muted small mb-2">{{ results|length }} results · {{ metric_label }}</p>
+  <p class="text-muted small mb-2">{{ results|length }} results (from {{ total_before_proximity }} before proximity dedupe) · {{ metric_label }}</p>
   <div class="row">
     {% for r in results %}
     <div class="col-md-3 mb-4">
@@ -1805,6 +2183,20 @@ document.addEventListener('DOMContentLoaded', function() {
 """,
         results=results,
   metric_label=SEARCH_METRICS[metric],
+  total_before_proximity=total_before_proximity,
+  search_q=q,
+  search_metric=metric,
+  search_date_from=date_from_raw,
+  search_date_to=date_to_raw,
+  search_window_filter=window_filter,
+  search_monitor_filter=(str(monitor_filter) if monitor_filter is not None else ""),
+  search_monitor_options=monitor_options,
+  search_proximity_seconds=proximity_seconds,
+  search_proximity_level=proximity_level,
+  search_proximity_human=_format_proximity_human(proximity_seconds),
+  search_proximity_max_seconds=proximity_max_seconds,
+  search_proximity_max_human=_format_proximity_human(proximity_max_seconds),
+  search_proximity_slider_steps=PROXIMITY_SLIDER_STEPS,
     )
 
 
