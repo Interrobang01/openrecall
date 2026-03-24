@@ -29,6 +29,11 @@ TimelineEntry = namedtuple(
         "segment_filename",
         "segment_pts_ms",
         "thumb_filename",
+        "app",
+        "title",
+        "text",
+        "embedding_magnitude",
+        "embedding_is_zero",
     ],
 )
 
@@ -223,13 +228,20 @@ def get_timeline_entries() -> List[TimelineEntry]:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT timestamp, monitor_id, segment_filename, segment_pts_ms, thumb_filename
+                SELECT timestamp, monitor_id, segment_filename, segment_pts_ms, thumb_filename, app, title, text, embedding
                 FROM entries
                 ORDER BY timestamp DESC, monitor_id ASC
                 """
             )
             results = cursor.fetchall()
             for row in results:
+                embedding_blob = row["embedding"]
+                embedding = (
+                    np.frombuffer(embedding_blob, dtype=np.float32)
+                    if embedding_blob
+                    else np.array([], dtype=np.float32)
+                )
+                embedding_magnitude = float(np.linalg.norm(embedding)) if embedding.size else 0.0
                 timeline_entries.append(
                     TimelineEntry(
                         timestamp=row["timestamp"],
@@ -237,6 +249,11 @@ def get_timeline_entries() -> List[TimelineEntry]:
                         segment_filename=row["segment_filename"],
                         segment_pts_ms=row["segment_pts_ms"],
                         thumb_filename=row["thumb_filename"],
+                        app=row["app"],
+                        title=row["title"],
+                        text=row["text"],
+                        embedding_magnitude=embedding_magnitude,
+                        embedding_is_zero=embedding_magnitude <= 1e-8,
                     )
                 )
     except sqlite3.Error as e:

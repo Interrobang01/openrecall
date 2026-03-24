@@ -113,6 +113,7 @@ class TestFrameEndpointPendingFallback(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data, b"RIFFdummywebp")
+            self.assertEqual(response.headers.get("X-OpenRecall-Frame-Source"), "pending_webp")
 
     def test_returns_not_found_when_segment_and_pending_missing(self):
         with tempfile.TemporaryDirectory() as tmp_segments, tempfile.TemporaryDirectory() as tmp_pending, mock.patch(
@@ -127,6 +128,62 @@ class TestFrameEndpointPendingFallback(unittest.TestCase):
             )
 
             self.assertEqual(response.status_code, 404)
+
+
+class TestOpenMediaFileApi(unittest.TestCase):
+    def setUp(self):
+        app.testing = True
+        self.client = app.test_client()
+
+    def test_open_media_file_success_for_thumbnail(self):
+        with tempfile.TemporaryDirectory() as tmp_thumbs, tempfile.TemporaryDirectory() as tmp_pending, tempfile.TemporaryDirectory() as tmp_segments, mock.patch(
+            "openrecall.app.thumbnails_path",
+            tmp_thumbs,
+        ), mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ), mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ), mock.patch("openrecall.app.subprocess.Popen") as popen_mock:
+            thumb_name = "200_m1.webp"
+            with open(os.path.join(tmp_thumbs, thumb_name), "wb") as thumb_file:
+                thumb_file.write(b"thumb")
+
+            response = self.client.post(
+                "/api/open-media-file",
+                json={
+                    "thumb_filename": thumb_name,
+                    "source": "thumbnail",
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.get_json().get("ok"))
+            popen_mock.assert_called_once()
+
+    def test_open_media_file_returns_not_found_for_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmp_thumbs, tempfile.TemporaryDirectory() as tmp_pending, tempfile.TemporaryDirectory() as tmp_segments, mock.patch(
+            "openrecall.app.thumbnails_path",
+            tmp_thumbs,
+        ), mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ), mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ):
+            response = self.client.post(
+                "/api/open-media-file",
+                json={
+                    "segment_filename": "999_m1.mkv",
+                    "thumb_filename": "999_m1.webp",
+                    "source": "video_frame",
+                },
+            )
+
+            self.assertEqual(response.status_code, 404)
+            self.assertFalse(response.get_json().get("ok"))
 
 
 if __name__ == "__main__":

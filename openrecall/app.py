@@ -95,6 +95,38 @@ def _json_safe(value):
     return value.tolist()
   return value
 
+
+def _embedding_magnitude(embedding: np.ndarray) -> float:
+  """Returns L2 norm of an embedding, or 0 for empty/invalid vectors."""
+  vector = np.asarray(embedding, dtype=np.float32)
+  if vector.size == 0:
+    return 0.0
+  return float(np.linalg.norm(vector))
+
+
+def _safe_media_name(filename: str, allowed_extensions: Tuple[str, ...]) -> str:
+  """Validates media filename and allowed extension, returning safe basename."""
+  candidate = os.path.basename((filename or "").strip())
+  if not candidate or candidate != (filename or "").strip():
+    return ""
+  if not candidate.endswith(allowed_extensions):
+    return ""
+  return candidate
+
+
+def _open_file_in_system_manager(filepath: str) -> Optional[str]:
+  """Opens the file location in platform file manager, returns error string on failure."""
+  try:
+    if sys.platform == "win32":
+      subprocess.Popen(["explorer", "/select,", filepath])
+    elif sys.platform == "darwin":
+      subprocess.Popen(["open", "-R", filepath])
+    else:
+      subprocess.Popen(["xdg-open", os.path.dirname(filepath)])
+    return None
+  except OSError as exc:
+    return str(exc)
+
 base_template = """
 <!DOCTYPE html>
 <html lang="en">
@@ -758,6 +790,11 @@ def timeline():
             "segment_filename": entry.segment_filename,
             "segment_pts_ms": entry.segment_pts_ms,
             "thumb_filename": entry.thumb_filename,
+      "app": entry.app or "",
+      "title": entry.title or "",
+      "text": entry.text or "",
+            "embedding_magnitude": entry.embedding_magnitude,
+            "embedding_is_zero": entry.embedding_is_zero,
         }
         for entry in get_timeline_entries()
     ]
@@ -807,20 +844,30 @@ def timeline():
     <div class="modal-dialog" role="document" style="max-width:min(1200px, 92vw); margin:2vh auto;">
       <div class="modal-content">
         <div class="modal-header py-2">
-          <div class="text-muted small" id="timelineModalLabel"></div>
-          <div class="ml-auto d-flex align-items-center" style="gap:6px;">
-            <button type="button" class="btn btn-sm btn-outline-secondary" id="timelinePrevBtn" title="Previous timestamp (←)">
-              <i class="bi bi-arrow-left"></i>
-            </button>
-            <button type="button" class="btn btn-sm btn-outline-secondary" id="timelineNextBtn" title="Next timestamp (→)">
-              <i class="bi bi-arrow-right"></i>
-            </button>
-          </div>
+          <div id="timelineModalMeta"></div>
           <button type="button" class="close" data-dismiss="modal"><span>&times;</span></button>
         </div>
-        <div class="modal-body p-0" style="background:#000;">
+        <div class="modal-body p-0 position-relative" style="background:#000;">
+          <button type="button" class="btn btn-sm btn-outline-light position-absolute" id="timelinePrevBtn"
+                  title="Previous timestamp (←)" style="left:10px; top:50%; transform:translateY(-50%); z-index:3;">
+            <i class="bi bi-arrow-left"></i>
+          </button>
+          <button type="button" class="btn btn-sm btn-outline-light position-absolute" id="timelineNextBtn"
+                  title="Next timestamp (→)" style="right:10px; top:50%; transform:translateY(-50%); z-index:3;">
+            <i class="bi bi-arrow-right"></i>
+          </button>
           <img id="timelineModalImage" src="" alt="timeline screenshot"
                style="max-height:80vh; max-width:100%; width:auto; height:auto; object-fit:contain; display:block; margin:0 auto;">
+        </div>
+        <div class="modal-footer py-2 d-block">
+          <div class="d-flex flex-wrap align-items-center mb-2" style="gap:6px;">
+            <span class="badge badge-warning" id="timelineSourceBadge">Thumbnail</span>
+            <span class="badge badge-light border text-muted" id="timelineEmbeddingBadge"></span>
+            <button type="button" class="btn btn-sm btn-outline-secondary ml-auto" id="timelineOpenFileBtn">Open frame file</button>
+          </div>
+          <div class="small text-muted mb-2" id="timelineOpenFileFeedback"></div>
+          <p class="mb-1 small text-muted font-weight-bold">OCR text:</p>
+          <pre id="timelineModalText" class="small mb-0" style="max-height:10rem; overflow-y:auto; white-space:pre-wrap; font-size:0.75rem;"></pre>
         </div>
       </div>
     </div>
@@ -878,13 +925,99 @@ const monitorInfo  = document.getElementById('monitorInfo');
 const monitorPanels = document.getElementById('monitorPanels');
 const modalElement = document.getElementById('timelineModal');
 const modalImage = document.getElementById('timelineModalImage');
-const modalLabel = document.getElementById('timelineModalLabel');
+const modalMeta = document.getElementById('timelineModalMeta');
+const modalText = document.getElementById('timelineModalText');
+const timelineSourceBadge = document.getElementById('timelineSourceBadge');
+const timelineEmbeddingBadge = document.getElementById('timelineEmbeddingBadge');
+const timelineOpenFileBtn = document.getElementById('timelineOpenFileBtn');
+const timelineOpenFileFeedback = document.getElementById('timelineOpenFileFeedback');
 
 let latestDisplayToken = 0;
 const fullFrameRetryCount = 8;
 const fullFrameRetryDelayMs = 280;
 const timelinePrevBtn = document.getElementById('timelinePrevBtn');
 const timelineNextBtn = document.getElementById('timelineNextBtn');
+let timelineModalObjectUrl = '';
+let timelineModalLoadToken = 0;
+
+function setTimelineFeedback(message, isError) {
+  if (!timelineOpenFileFeedback) {
+    return;
+  }
+  timelineOpenFileFeedback.textContent = message;
+  timelineOpenFileFeedback.className = isError ? 'small text-danger mb-2' : 'small text-muted mb-2';
+}
+
+function setTimelineSourceBadge(source) {
+  if (!timelineSourceBadge) {
+    return;
+  }
+
+  timelineSourceBadge.className = 'badge';
+  if (source === 'video_frame') {
+    timelineSourceBadge.classList.add('badge-success');
+    timelineSourceBadge.textContent = 'Video frame';
+    return;
+  }
+
+  if (source === 'pending_webp') {
+    timelineSourceBadge.classList.add('badge-info');
+    timelineSourceBadge.textContent = 'Lossless WebP (pending video)';
+    return;
+  }
+
+  timelineSourceBadge.classList.add('badge-warning');
+  timelineSourceBadge.textContent = 'Thumbnail';
+}
+
+function formatEmbeddingBadge(item) {
+  const magnitude = Number(item.embedding_magnitude || 0);
+  if (item.embedding_is_zero || magnitude <= 1e-8) {
+    return 'Embedding ‖e‖=0 (zero)';
+  }
+  return 'Embedding ‖e‖=' + magnitude.toFixed(4);
+}
+
+function buildFrameAttemptUrl(frameUrl, attempt) {
+  return frameUrl + '&retry=' + attempt + '_' + Date.now();
+}
+
+function fetchFrameWithRetries(frameUrl, expectedToken, onSuccess, onFailure) {
+  function attemptFetch(attempt) {
+    if (expectedToken !== timelineModalLoadToken) {
+      return;
+    }
+
+    const trialUrl = buildFrameAttemptUrl(frameUrl, attempt);
+    fetch(trialUrl)
+      .then(function(response) {
+        if (!response.ok) {
+          throw new Error('Frame request failed');
+        }
+        const source = response.headers.get('X-OpenRecall-Frame-Source') || 'video_frame';
+        return response.blob().then(function(blob) {
+          return {blob: blob, source: source};
+        });
+      })
+      .then(function(result) {
+        if (expectedToken !== timelineModalLoadToken) {
+          return;
+        }
+        onSuccess(result.blob, result.source);
+      })
+      .catch(function() {
+        if (attempt < fullFrameRetryCount) {
+          setTimeout(function() {
+            attemptFetch(attempt + 1);
+          }, fullFrameRetryDelayMs);
+          return;
+        }
+        onFailure();
+      });
+  }
+
+  attemptFetch(0);
+}
 
 function findLatestForMonitorAtOrBefore(monitorId, timestamp) {
   for (let i = 0; i < groupedByTimestamp.length; i += 1) {
@@ -946,17 +1079,41 @@ function upgradeImageToFull(imageElement, item, expectedToken) {
   tryLoadFullFrame(0);
 }
 
-function openTimelineModal(item) {
+function openTimelineModal(item, groupTimestamp, isFallback) {
+  timelineModalLoadToken += 1;
+  if (timelineModalObjectUrl) {
+    URL.revokeObjectURL(timelineModalObjectUrl);
+    timelineModalObjectUrl = '';
+  }
   modalImage.src = '/static/' + item.thumb_filename;
   modalImage.dataset.segment = item.segment_filename;
   modalImage.dataset.ptsMs = String(item.segment_pts_ms || 0);
   modalImage.dataset.thumb = item.thumb_filename;
   modalImage.dataset.monitorId = String(item.monitor_id);
-  modalImage.dataset.timestamp = String(item.timestamp);
+  modalImage.dataset.groupTimestamp = String(groupTimestamp || item.timestamp);
   modalImage.dataset.fullLoaded = '0';
   modalImage.dataset.fullLoading = '0';
-  modalLabel.textContent =
-    new Date(item.timestamp * 1000).toLocaleString() + ' · monitor ' + item.monitor_id;
+
+  const displayTimestamp = Number(groupTimestamp || item.timestamp);
+  const appTitle = item.app
+    ? ' <span class="ml-2 text-muted small">' + item.app + (item.title ? ' — ' + item.title : '') + '</span>'
+    : '';
+  const fallbackBadge = isFallback
+    ? '<span class="badge badge-secondary ml-2">Fallback frame</span>'
+    : '';
+
+  modalMeta.innerHTML =
+    '<span class="badge badge-primary">Monitor ' + item.monitor_id + '</span>' +
+    '<span class="ml-2 text-muted small">' + new Date(displayTimestamp * 1000).toLocaleString() + '</span>' +
+    fallbackBadge +
+    appTitle;
+  modalText.textContent = item.text || 'No OCR text.';
+  if (timelineEmbeddingBadge) {
+    timelineEmbeddingBadge.textContent = formatEmbeddingBadge(item);
+  }
+  setTimelineSourceBadge('thumbnail');
+  modalImage.dataset.source = 'thumbnail';
+  setTimelineFeedback('', false);
 
   setTimeout(function() {
     upgradeTimelineModalImage();
@@ -974,31 +1131,49 @@ function upgradeTimelineModalImage() {
   }
 
   image.dataset.fullLoading = '1';
+  const expectedToken = timelineModalLoadToken;
   const frameUrl = '/frame?segment=' + encodeURIComponent(image.dataset.segment || '') +
     '&pts_ms=' + encodeURIComponent(image.dataset.ptsMs || '0') +
     '&thumb=' + encodeURIComponent(image.dataset.thumb || '');
 
-  function tryLoadFullFrame(attempt) {
-    const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
-    const fullFrame = new Image();
-    fullFrame.onload = function () {
-      image.src = trialUrl;
+  fetchFrameWithRetries(
+    frameUrl,
+    expectedToken,
+    function(blob, source) {
+      if (timelineModalObjectUrl) {
+        URL.revokeObjectURL(timelineModalObjectUrl);
+      }
+      timelineModalObjectUrl = URL.createObjectURL(blob);
+      image.src = timelineModalObjectUrl;
       image.dataset.fullLoaded = '1';
       image.dataset.fullLoading = '0';
-    };
-    fullFrame.onerror = function () {
-      if (attempt < fullFrameRetryCount) {
-        setTimeout(function () {
-          tryLoadFullFrame(attempt + 1);
-        }, fullFrameRetryDelayMs);
+      image.dataset.source = source;
+      setTimelineSourceBadge(source);
+    },
+    function() {
+      image.dataset.fullLoading = '0';
+    }
+  );
+}
+
+function openCurrentTimelineFile() {
+  const payload = {
+    segment_filename: modalImage.dataset.segment || '',
+    thumb_filename: modalImage.dataset.thumb || '',
+    source: modalImage.dataset.source || 'thumbnail',
+  };
+
+  postJson('/api/open-media-file', payload)
+    .then(function(response) {
+      if (!response.ok) {
+        setTimelineFeedback(response.error || 'Unable to open frame file.', true);
         return;
       }
-      image.dataset.fullLoading = '0';
-    };
-    fullFrame.src = trialUrl;
-  }
-
-  tryLoadFullFrame(0);
+      setTimelineFeedback('Opened: ' + (response.opened_path || 'file'), false);
+    })
+    .catch(function() {
+      setTimelineFeedback('Unable to open frame file.', true);
+    });
 }
 
 function renderMonitorPanels(group) {
@@ -1052,7 +1227,7 @@ function renderMonitorPanels(group) {
 
       trigger.addEventListener('click', function(evt) {
         evt.preventDefault();
-        openTimelineModal(entry);
+        openTimelineModal(entry, group.timestamp, isFallback);
       });
 
       body.appendChild(trigger);
@@ -1095,15 +1270,15 @@ function updateDisplay() {
 }
 
 function navigateTimelineModal(delta) {
-  if (!modalImage || !modalImage.dataset.timestamp || !modalImage.dataset.monitorId) {
+  if (!modalImage || !modalImage.dataset.groupTimestamp || !modalImage.dataset.monitorId) {
     return;
   }
 
-  const currentTimestamp = Number(modalImage.dataset.timestamp);
+  const currentGroupTimestamp = Number(modalImage.dataset.groupTimestamp);
   const monitorId = Number(modalImage.dataset.monitorId);
 
   const currentIndex = groupedByTimestamp.findIndex(function(item) {
-    return item.timestamp === currentTimestamp;
+    return item.timestamp === currentGroupTimestamp;
   });
   if (currentIndex < 0) {
     return;
@@ -1120,7 +1295,11 @@ function navigateTimelineModal(delta) {
     return;
   }
 
-  openTimelineModal(nextEntry);
+  const targetGroup = groupedByTimestamp[nextIndex];
+  const exactEntry = targetGroup.items[String(monitorId)] || null;
+  const isFallback = !exactEntry && !!nextEntry;
+
+  openTimelineModal(nextEntry, targetTimestamp, isFallback);
 }
 
 if (window.jQuery) {
@@ -1138,6 +1317,12 @@ if (timelinePrevBtn) {
 if (timelineNextBtn) {
   timelineNextBtn.addEventListener('click', function() {
     navigateTimelineModal(-1);
+  });
+}
+
+if (timelineOpenFileBtn) {
+  timelineOpenFileBtn.addEventListener('click', function() {
+    openCurrentTimelineFile();
   });
 }
 
@@ -1220,6 +1405,7 @@ def search():
             reverse=_score_sort_descending(metric),
         )
         for index, score in scored_candidates:
+            embedding_magnitude = _embedding_magnitude(entries[index].embedding)
             results.append(
                 {
                     "timestamp": entries[index].timestamp,
@@ -1231,10 +1417,13 @@ def search():
                     "title": entries[index].title or "",
                     "text": entries[index].text or "",
                     "score": _format_search_score(metric, score, bool(expression_terms)),
+                    "embedding_magnitude": embedding_magnitude,
+                    "embedding_is_zero": embedding_magnitude <= 1e-8,
                 }
             )
     elif exact_phrases:
         for index in candidate_indices:
+            embedding_magnitude = _embedding_magnitude(entries[index].embedding)
             results.append(
                 {
                     "timestamp": entries[index].timestamp,
@@ -1246,6 +1435,8 @@ def search():
                     "title": entries[index].title or "",
                     "text": entries[index].text or "",
                     "score": "Exact",
+                    "embedding_magnitude": embedding_magnitude,
+                    "embedding_is_zero": embedding_magnitude <= 1e-8,
                 }
             )
 
@@ -1309,6 +1500,12 @@ def search():
                style="max-height:80vh; max-width:100%; width:100%; height:100%; object-fit:contain; display:block; margin:0 auto;">
         </div>
         <div class="modal-footer py-2 d-block">
+          <div class="d-flex flex-wrap align-items-center mb-2" style="gap:6px;">
+            <span class="badge badge-warning" id="searchSourceBadge">Thumbnail</span>
+            <span class="badge badge-light border text-muted" id="searchEmbeddingBadge"></span>
+            <button type="button" class="btn btn-sm btn-outline-secondary ml-auto" id="searchOpenFileBtn">Open frame file</button>
+          </div>
+          <div class="small text-muted mb-2" id="searchOpenFileFeedback"></div>
           <p class="mb-1 small text-muted font-weight-bold">OCR text:</p>
           <pre id="searchModalText" class="small mb-0" style="max-height:10rem; overflow-y:auto; white-space:pre-wrap; font-size:0.75rem;"></pre>
         </div>
@@ -1327,9 +1524,90 @@ document.addEventListener('DOMContentLoaded', function() {
   const image = document.getElementById('searchModalImage');
   const text = document.getElementById('searchModalText');
   const meta = document.getElementById('searchModalMeta');
+  const sourceBadge = document.getElementById('searchSourceBadge');
+  const embeddingBadge = document.getElementById('searchEmbeddingBadge');
+  const openFileBtn = document.getElementById('searchOpenFileBtn');
+  const openFileFeedback = document.getElementById('searchOpenFileFeedback');
   const prevBtn = document.getElementById('searchPrevBtn');
   const nextBtn = document.getElementById('searchNextBtn');
   let currentIndex = -1;
+  let searchModalObjectUrl = '';
+  let searchModalLoadToken = 0;
+
+  function setOpenFileFeedback(message, isError) {
+    if (!openFileFeedback) {
+      return;
+    }
+    openFileFeedback.textContent = message;
+    openFileFeedback.className = isError ? 'small text-danger mb-2' : 'small text-muted mb-2';
+  }
+
+  function setSourceBadge(source) {
+    if (!sourceBadge) {
+      return;
+    }
+    sourceBadge.className = 'badge';
+    if (source === 'video_frame') {
+      sourceBadge.classList.add('badge-success');
+      sourceBadge.textContent = 'Video frame';
+      return;
+    }
+    if (source === 'pending_webp') {
+      sourceBadge.classList.add('badge-info');
+      sourceBadge.textContent = 'Lossless WebP (pending video)';
+      return;
+    }
+    sourceBadge.classList.add('badge-warning');
+    sourceBadge.textContent = 'Thumbnail';
+  }
+
+  function formatEmbeddingBadge(result) {
+    const magnitude = Number(result.embedding_magnitude || 0);
+    if (result.embedding_is_zero || magnitude <= 1e-8) {
+      return 'Embedding ‖e‖=0 (zero)';
+    }
+    return 'Embedding ‖e‖=' + magnitude.toFixed(4);
+  }
+
+  function buildTrialUrl(frameUrl, attempt) {
+    return frameUrl + '&retry=' + attempt + '_' + Date.now();
+  }
+
+  function fetchFrameWithRetries(frameUrl, expectedToken, onSuccess, onFailure) {
+    function tryFetch(attempt) {
+      if (expectedToken !== searchModalLoadToken) {
+        return;
+      }
+      const trialUrl = buildTrialUrl(frameUrl, attempt);
+      fetch(trialUrl)
+        .then(function(response) {
+          if (!response.ok) {
+            throw new Error('Frame request failed');
+          }
+          const source = response.headers.get('X-OpenRecall-Frame-Source') || 'video_frame';
+          return response.blob().then(function(blob) {
+            return {blob: blob, source: source};
+          });
+        })
+        .then(function(result) {
+          if (expectedToken !== searchModalLoadToken) {
+            return;
+          }
+          onSuccess(result.blob, result.source);
+        })
+        .catch(function() {
+          if (attempt < fullFrameRetryCount) {
+            setTimeout(function() {
+              tryFetch(attempt + 1);
+            }, fullFrameRetryDelayMs);
+            return;
+          }
+          onFailure();
+        });
+    }
+
+    tryFetch(0);
+  }
 
   function buildFrameUrl(result) {
     return '/frame?segment=' + encodeURIComponent(result.segment_filename) +
@@ -1342,30 +1620,28 @@ document.addEventListener('DOMContentLoaded', function() {
       return;
     }
     image.dataset.fullLoading = '1';
+    const expectedToken = searchModalLoadToken;
 
     const frameUrl = buildFrameUrl(result);
 
-    function tryLoadFullFrame(attempt) {
-      const trialUrl = frameUrl + '&retry=' + attempt + '_' + Date.now();
-      const fullFrame = new Image();
-      fullFrame.onload = function() {
-        image.src = trialUrl;
+    fetchFrameWithRetries(
+      frameUrl,
+      expectedToken,
+      function(blob, source) {
+        if (searchModalObjectUrl) {
+          URL.revokeObjectURL(searchModalObjectUrl);
+        }
+        searchModalObjectUrl = URL.createObjectURL(blob);
+        image.src = searchModalObjectUrl;
         image.dataset.fullLoaded = '1';
         image.dataset.fullLoading = '0';
-      };
-      fullFrame.onerror = function() {
-        if (attempt < fullFrameRetryCount) {
-          setTimeout(function() {
-            tryLoadFullFrame(attempt + 1);
-          }, fullFrameRetryDelayMs);
-          return;
-        }
+        image.dataset.source = source;
+        setSourceBadge(source);
+      },
+      function() {
         image.dataset.fullLoading = '0';
-      };
-      fullFrame.src = trialUrl;
-    }
-
-    tryLoadFullFrame(0);
+      }
+    );
   }
 
   function updateNavButtons() {
@@ -1381,11 +1657,17 @@ document.addEventListener('DOMContentLoaded', function() {
       return;
     }
     currentIndex = index;
+    searchModalLoadToken += 1;
     const result = results[index];
 
+    if (searchModalObjectUrl) {
+      URL.revokeObjectURL(searchModalObjectUrl);
+      searchModalObjectUrl = '';
+    }
     image.src = '/static/' + result.thumb_filename;
     image.dataset.fullLoaded = '0';
     image.dataset.fullLoading = '0';
+    image.dataset.source = 'thumbnail';
 
     const appTitle = result.app
       ? ' <span class="ml-2 text-muted small">' + result.app + (result.title ? ' — ' + result.title : '') + '</span>'
@@ -1397,6 +1679,11 @@ document.addEventListener('DOMContentLoaded', function() {
       appTitle;
 
     text.textContent = result.text || 'No OCR text.';
+    if (embeddingBadge) {
+      embeddingBadge.textContent = formatEmbeddingBadge(result);
+    }
+    setSourceBadge('thumbnail');
+    setOpenFileFeedback('', false);
     updateNavButtons();
     setTimeout(function() {
       upgradeModalImage(result);
@@ -1446,6 +1733,30 @@ document.addEventListener('DOMContentLoaded', function() {
   if (nextBtn) {
     nextBtn.addEventListener('click', function() {
       navigate(1);
+    });
+  }
+
+  if (openFileBtn) {
+    openFileBtn.addEventListener('click', function() {
+      if (currentIndex < 0 || currentIndex >= results.length) {
+        return;
+      }
+      const current = results[currentIndex];
+      postJson('/api/open-media-file', {
+        segment_filename: current.segment_filename || '',
+        thumb_filename: current.thumb_filename || '',
+        source: image.dataset.source || 'thumbnail',
+      })
+        .then(function(response) {
+          if (!response.ok) {
+            setOpenFileFeedback(response.error || 'Unable to open frame file.', true);
+            return;
+          }
+          setOpenFileFeedback('Opened: ' + (response.opened_path || 'file'), false);
+        })
+        .catch(function() {
+          setOpenFileFeedback('Unable to open frame file.', true);
+        });
     });
   }
 
@@ -1506,7 +1817,9 @@ def serve_frame():
 
     if not os.path.exists(segment_filepath):
       if pending_frame_filepath and os.path.exists(pending_frame_filepath):
-        return send_from_directory(pending_frames_path, safe_thumb_name)
+        response = send_from_directory(pending_frames_path, safe_thumb_name)
+        response.headers["X-OpenRecall-Frame-Source"] = "pending_webp"
+        return response
       return jsonify({"error": "Segment not found"}), 404
 
     frame_index = None
@@ -1629,7 +1942,9 @@ def serve_frame():
                 os.remove(temp_filepath)
             return jsonify({"error": f"Failed to decode frame: {last_error or 'unknown error'}"}), 500
 
-    return send_from_directory(frame_cache_path, frame_cache_filename)
+    response = send_from_directory(frame_cache_path, frame_cache_filename)
+    response.headers["X-OpenRecall-Frame-Source"] = "video_frame"
+    return response
 
 
 @app.route("/api/stats")
@@ -1748,6 +2063,66 @@ def open_folder():
         return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/api/open-media-file", methods=["POST"])
+def api_open_media_file():
+    """Opens frame-related media file in system file manager.
+
+    Resolves the best available file for the requested source state.
+    """
+    payload = request.get_json(silent=True) or {}
+    source = (payload.get("source") or "").strip().lower()
+    segment_name = _safe_media_name(
+      payload.get("segment_filename") or "",
+      (".mkv",),
+    )
+    thumb_name = _safe_media_name(
+      payload.get("thumb_filename") or "",
+      (".webp", ".jpg", ".jpeg", ".png"),
+    )
+
+    preferred_paths: List[str] = []
+    if source == "thumbnail" and thumb_name:
+      preferred_paths.append(os.path.join(thumbnails_path, thumb_name))
+    elif source == "pending_webp" and thumb_name:
+      preferred_paths.append(os.path.join(pending_frames_path, thumb_name))
+    elif source == "video_frame" and segment_name:
+      preferred_paths.append(os.path.join(segments_path, segment_name))
+
+    fallback_paths: List[str] = []
+    if thumb_name:
+      fallback_paths.append(os.path.join(thumbnails_path, thumb_name))
+      fallback_paths.append(os.path.join(pending_frames_path, thumb_name))
+    if segment_name:
+      fallback_paths.append(os.path.join(segments_path, segment_name))
+
+    candidate_paths: List[str] = []
+    seen_paths = set()
+    for path in preferred_paths + fallback_paths:
+      if path not in seen_paths:
+        seen_paths.add(path)
+        candidate_paths.append(path)
+
+    target_path = next((path for path in candidate_paths if os.path.exists(path)), "")
+    if not target_path:
+      return jsonify(
+        {
+          "ok": False,
+          "error": "Frame file is not available right now (drive may be locked or unmounted).",
+        }
+      ), 404
+
+    open_error = _open_file_in_system_manager(target_path)
+    if open_error:
+      return jsonify({"ok": False, "error": open_error}), 500
+
+    return jsonify(
+      {
+        "ok": True,
+        "opened_path": os.path.basename(target_path),
+      }
+    )
 
 
 def _parse_config_form_value(raw_value: str) -> object:
