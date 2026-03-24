@@ -170,8 +170,7 @@ You can tune performance with environment variables:
 - `OPENRECALL_AV1_THREADS` (default `0` = ffmpeg default; set `1..N` to cap encoder threads)
 - `OPENRECALL_AV1_SVTAV1_PARAMS` (default empty; raw `-svtav1-params` string, e.g. `lp=2:scd=0`)
 - `OPENRECALL_AV1_PLAYBACK_FPS` (default `2.0`, min `0.1`; encoded segment framerate used by video players)
-- `OPENRECALL_AV1_SEGMENT_FRAMES` (default `30`; min `1`; rotates segments by frame count)
-- `OPENRECALL_AV1_SEGMENT_SECONDS` (legacy/default-derivation knob; default `120`, min `1.0`)
+- `OPENRECALL_AV1_SEGMENT_FRAMES` (default `30`; min `1`; number of lossless full-res WebPs buffered before each AV1 segment flush)
 - `OPENRECALL_THUMB_QUALITY` (default `8`, range `1..100`)
 - `OPENRECALL_THUMB_MAX_DIMENSION` (default `320`, range `64..4096`)
 

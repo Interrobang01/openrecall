@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from threading import Thread
 from typing import Dict, List, Optional, Tuple
 
@@ -12,8 +13,14 @@ os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from jinja2 import BaseLoader
+from PIL import Image
 
 from openrecall.config import (
+  OPENRECALL_AV1_CRF,
+  OPENRECALL_AV1_PLAYBACK_FPS,
+  OPENRECALL_AV1_PRESET,
+  OPENRECALL_AV1_SVTAV1_PARAMS,
+  OPENRECALL_AV1_THREADS,
     OPENRECALL_FFMPEG_BIN,
     OPENRECALL_STORAGE_BACKEND,
     RUNTIME_CONFIG_KEYS,
@@ -33,6 +40,7 @@ from openrecall.database import (
     delete_entries_by_segment_filenames,
     get_all_entries,
     get_media_entries_for_segments,
+    get_pending_segment_recovery_entries,
   get_segment_frame_index,
     get_timestamps,
     get_timeline_entries,
@@ -55,6 +63,7 @@ from openrecall.screenshot import (
   set_capture_pause_forever,
 )
 from openrecall.hotkeys import start_hotkey_listener
+from openrecall.tray import start_linux_tray
 from openrecall.utils import human_readable_time, timestamp_to_human_readable
 
 app = Flask(__name__)
@@ -75,6 +84,11 @@ startup_recovery_state: Dict[str, object] = {
   "entries_removed": 0,
   "thumbs_removed": 0,
   "cache_removed": 0,
+  "pending_recovered_segments": 0,
+  "pending_recovered_frames": 0,
+  "pending_recovery_failed_segments": [],
+  "pending_orphan_frames": 0,
+  "pending_orphan_frames_purged": 0,
 }
 
 SEARCH_METRICS = {
@@ -812,6 +826,253 @@ def _recover_recent_corrupt_segments() -> None:
   startup_recovery_state["entries_removed"] = int(deleted_entries)
   startup_recovery_state["thumbs_removed"] = int(removed_thumbs)
   startup_recovery_state["cache_removed"] = int(removed_cached_frames)
+
+
+def _encode_pending_frames_into_segment(
+  segment_name: str,
+  ordered_thumb_names: List[str],
+) -> bool:
+  """Encodes ordered pending full-resolution WebPs into one AV1 segment."""
+  if not ordered_thumb_names:
+    return False
+
+  frame_filepaths = [
+    os.path.join(pending_frames_path, thumb_name)
+    for thumb_name in ordered_thumb_names
+  ]
+  if any(not os.path.exists(path) for path in frame_filepaths):
+    return False
+
+  first_frame = None
+  width = 0
+  height = 0
+  try:
+    with Image.open(frame_filepaths[0]) as image:
+      first_frame = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width = first_frame.shape[:2]
+  except OSError:
+    return False
+
+  if width <= 0 or height <= 0:
+    return False
+
+  segment_filepath = os.path.join(segments_path, segment_name)
+  temp_segment_path = f"{segment_filepath}.recovering.mkv"
+  fps = OPENRECALL_AV1_PLAYBACK_FPS
+
+  ffmpeg_command = [
+    OPENRECALL_FFMPEG_BIN,
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "rgb24",
+    "-video_size",
+    f"{width}x{height}",
+    "-framerate",
+    f"{fps:.6f}",
+    "-i",
+    "-",
+    "-an",
+    "-c:v",
+    "libsvtav1",
+    "-crf",
+    str(OPENRECALL_AV1_CRF),
+    "-preset",
+    OPENRECALL_AV1_PRESET,
+  ]
+
+  if OPENRECALL_AV1_THREADS > 0:
+    ffmpeg_command.extend(["-threads", str(OPENRECALL_AV1_THREADS)])
+  if OPENRECALL_AV1_SVTAV1_PARAMS:
+    ffmpeg_command.extend(["-svtav1-params", OPENRECALL_AV1_SVTAV1_PARAMS])
+
+  ffmpeg_command.extend(["-f", "matroska"])
+  ffmpeg_command.append(temp_segment_path)
+
+  process = None
+  try:
+    process = subprocess.Popen(
+      ffmpeg_command,
+      stdin=subprocess.PIPE,
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.PIPE,
+    )
+    if process.stdin is None:
+      return False
+
+    for index, frame_path in enumerate(frame_filepaths):
+      if index == 0 and first_frame is not None:
+        frame_rgb = first_frame
+      else:
+        with Image.open(frame_path) as frame_image:
+          frame_rgb = np.asarray(frame_image.convert("RGB"), dtype=np.uint8)
+
+      if frame_rgb.shape[:2] != (height, width):
+        raise RuntimeError("Pending frame dimensions do not match within segment batch")
+
+      try:
+        process.stdin.write(np.ascontiguousarray(frame_rgb, dtype=np.uint8).tobytes())
+      except (BrokenPipeError, OSError) as exc:
+        stderr_text = ""
+        if process.stderr is not None:
+          stderr_text = (process.stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+          f"ffmpeg write failed for segment {segment_name}: {stderr_text or exc}"
+        ) from exc
+
+    process.stdin.close()
+    process.stdin = None
+
+    stderr_bytes = b""
+    try:
+      _, stderr_bytes = process.communicate(timeout=90)
+    except ValueError:
+      try:
+        process.wait(timeout=90)
+      except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=30)
+      if process.stderr is not None:
+        stderr_bytes = process.stderr.read() or b""
+    except subprocess.TimeoutExpired:
+      process.kill()
+      _, stderr_bytes = process.communicate()
+
+    if process.returncode != 0:
+      stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+      raise RuntimeError(f"ffmpeg failed for segment {segment_name}: {stderr_text}")
+
+    os.replace(temp_segment_path, segment_filepath)
+
+    for frame_path in frame_filepaths:
+      try:
+        os.remove(frame_path)
+      except OSError:
+        pass
+
+    return True
+  except (OSError, RuntimeError) as exc:
+    if os.path.exists(temp_segment_path):
+      try:
+        os.remove(temp_segment_path)
+      except OSError:
+        pass
+    print(
+      f"Startup pending recovery: failed encoding segment {segment_name}: {exc}",
+      file=sys.stderr,
+    )
+    return False
+  finally:
+    if process is not None and process.stdin is not None:
+      try:
+        process.stdin.close()
+      except OSError:
+        pass
+
+
+def _recover_pending_webp_segments() -> None:
+  """Encodes startup pending full-resolution WebPs into missing AV1 segments."""
+  startup_recovery_state["pending_recovered_segments"] = 0
+  startup_recovery_state["pending_recovered_frames"] = 0
+  startup_recovery_state["pending_recovery_failed_segments"] = []
+  startup_recovery_state["pending_orphan_frames"] = 0
+  startup_recovery_state["pending_orphan_frames_purged"] = 0
+
+  pending_frame_paths = glob.glob(os.path.join(pending_frames_path, "*.webp"))
+  pending_frame_paths.extend(glob.glob(os.path.join(pending_frames_path, "*.png")))
+  if not pending_frame_paths:
+    return
+
+  pending_thumb_names = [os.path.basename(path) for path in pending_frame_paths]
+  pending_paths_by_name = {
+    os.path.basename(path): path
+    for path in pending_frame_paths
+  }
+  pending_set = set(pending_thumb_names)
+
+  def _purge_orphan_files(orphan_thumb_names: List[str]) -> Tuple[int, int]:
+    purged_count = 0
+    failed_count = 0
+    for thumb_name in sorted(set(orphan_thumb_names)):
+      orphan_path = pending_paths_by_name.get(thumb_name)
+      if not orphan_path or not os.path.exists(orphan_path):
+        continue
+      try:
+        os.remove(orphan_path)
+        purged_count += 1
+      except OSError:
+        failed_count += 1
+    return purged_count, failed_count
+
+  recovery_rows = get_pending_segment_recovery_entries(pending_thumb_names)
+  if not recovery_rows:
+    purged, failed = _purge_orphan_files(pending_thumb_names)
+    startup_recovery_state["pending_orphan_frames_purged"] = purged
+    startup_recovery_state["pending_orphan_frames"] = failed
+    return
+
+  grouped_rows: Dict[str, List[object]] = defaultdict(list)
+  for row in recovery_rows:
+    segment_path = os.path.join(segments_path, row.segment_filename)
+    if os.path.exists(segment_path):
+      continue
+    grouped_rows[row.segment_filename].append(row)
+
+  recovered_segments = 0
+  recovered_frames = 0
+  failed_segments: List[str] = []
+  attached_thumbs = {row.thumb_filename for row in recovery_rows}
+  orphan_thumb_names = list(pending_set - attached_thumbs)
+  purged_orphans, failed_orphan_deletes = _purge_orphan_files(orphan_thumb_names)
+
+  for segment_name, rows in grouped_rows.items():
+    expected_rows = get_media_entries_for_segments([segment_name])
+    expected_thumbs = {thumb for _, thumb in expected_rows}
+    if not expected_thumbs:
+      failed_segments.append(segment_name)
+      continue
+
+    if not expected_thumbs.issubset(pending_set):
+      failed_segments.append(segment_name)
+      continue
+
+    ordered_thumb_names: List[str] = []
+    seen_thumbs = set()
+    for row in rows:
+      if row.thumb_filename in expected_thumbs and row.thumb_filename not in seen_thumbs:
+        ordered_thumb_names.append(row.thumb_filename)
+        seen_thumbs.add(row.thumb_filename)
+
+    if len(ordered_thumb_names) != len(expected_thumbs):
+      failed_segments.append(segment_name)
+      continue
+
+    if _encode_pending_frames_into_segment(segment_name, ordered_thumb_names):
+      recovered_segments += 1
+      recovered_frames += len(ordered_thumb_names)
+    else:
+      failed_segments.append(segment_name)
+
+  startup_recovery_state["pending_recovered_segments"] = recovered_segments
+  startup_recovery_state["pending_recovered_frames"] = recovered_frames
+  startup_recovery_state["pending_recovery_failed_segments"] = sorted(set(failed_segments))
+  startup_recovery_state["pending_orphan_frames"] = failed_orphan_deletes
+  startup_recovery_state["pending_orphan_frames_purged"] = purged_orphans
+
+  if recovered_segments or failed_segments or purged_orphans or failed_orphan_deletes:
+    print(
+      "Startup pending recovery: "
+      f"segments_recovered={recovered_segments} "
+      f"frames_recovered={recovered_frames} "
+      f"segments_failed={len(set(failed_segments))} "
+      f"orphan_frames_purged={purged_orphans} "
+      f"orphan_frames={failed_orphan_deletes}",
+      file=sys.stderr,
+    )
 
 
 def _parse_search_query(raw_query: str) -> Tuple[str, List[str]]:
@@ -2576,6 +2837,185 @@ def config_page():
         except OSError as exc:
             save_error = f"Failed saving config: {exc}"
 
+    def _format_field_value(value: object) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    formatted_values = {
+        key: _format_field_value(value)
+        for key, value in effective_values.items()
+    }
+
+    field_meta: Dict[str, Dict[str, str]] = {
+        "OPENRECALL_AV1_CRF": {
+            "label": "AV1 CRF",
+            "hint": "Lower = better quality and larger segments. Higher = smaller segments and lower visual fidelity.",
+        },
+        "OPENRECALL_AV1_PRESET": {
+            "label": "AV1 Preset",
+            "hint": "Lower = slower encode, usually better compression. Higher = faster encode, usually larger files.",
+        },
+        "OPENRECALL_AV1_THREADS": {
+            "label": "AV1 Encode Threads",
+            "hint": "0 lets ffmpeg choose automatically. Set >0 to cap CPU thread usage.",
+        },
+        "OPENRECALL_AV1_SVTAV1_PARAMS": {
+            "label": "SVT-AV1 Raw Params",
+            "hint": "Advanced ffmpeg `-svtav1-params` string, e.g. `lp=2:scd=0`.",
+        },
+        "OPENRECALL_AV1_PLAYBACK_FPS": {
+            "label": "Segment Playback FPS",
+            "hint": "Playback frame rate used when writing AV1 segments.",
+        },
+        "OPENRECALL_AV1_SEGMENT_FRAMES": {
+            "label": "Lossless WebPs Before AV1 Encode",
+            "hint": "How many full-resolution lossless WebP frames are buffered per monitor before flushing to one AV1 segment.",
+        },
+        "OPENRECALL_THUMB_QUALITY": {
+            "label": "Thumbnail Quality",
+            "hint": "Lossy WebP thumbnail quality (1-100). Lower values reduce storage and can reduce utility.",
+        },
+        "OPENRECALL_THUMB_MAX_DIMENSION": {
+            "label": "Thumbnail Max Dimension",
+            "hint": "Maximum thumbnail width/height in pixels. Smaller values save storage and memory.",
+        },
+        "OPENRECALL_CAPTURE_INTERVAL_SECONDS": {
+            "label": "Capture Interval (seconds)",
+            "hint": "Delay between capture checks. Lower values capture more often but increase CPU/storage usage.",
+        },
+        "OPENRECALL_SIMILARITY_FRAME_WIDTH": {
+            "label": "Similarity Check Width",
+            "hint": "Downscale width for frame similarity checks. 0 disables downscaling.",
+        },
+        "OPENRECALL_VERBOSE_CAPTURE_LOGS": {
+            "label": "Verbose Capture Logs",
+            "hint": "Boolean: true/false.",
+        },
+        "OPENRECALL_STORAGE_BACKEND": {
+            "label": "Storage Backend",
+            "hint": "Must remain `av1_hybrid`.",
+        },
+        "OPENRECALL_FFMPEG_BIN": {
+            "label": "ffmpeg Binary",
+            "hint": "Executable name/path used for AV1 encoding and decode operations.",
+        },
+        "OPENRECALL_BLACKLIST_WINDOWS": {
+            "label": "Window Blacklist Terms",
+            "hint": "Comma-separated terms. Matching windows are skipped from capture.",
+        },
+        "OPENRECALL_BLACKLIST_WORDS": {
+            "label": "OCR Blacklist Terms",
+            "hint": "Comma-separated terms. Captures whose OCR contains these terms are skipped.",
+        },
+        "OPENRECALL_HOTKEY_PAUSE_5M": {
+            "label": "Hotkey: Pause 5m",
+            "hint": "Global hotkey chord for pausing capture 5 minutes.",
+        },
+        "OPENRECALL_HOTKEY_PAUSE_30M": {
+            "label": "Hotkey: Pause 30m",
+            "hint": "Global hotkey chord for pausing capture 30 minutes.",
+        },
+        "OPENRECALL_HOTKEY_PAUSE_FOREVER": {
+            "label": "Hotkey: Pause Forever",
+            "hint": "Global hotkey chord for indefinite pause.",
+        },
+        "OPENRECALL_HOTKEY_RESUME": {
+            "label": "Hotkey: Resume",
+            "hint": "Global hotkey chord for resuming capture.",
+        },
+    }
+
+    config_sections: List[Dict[str, object]] = [
+        {
+            "title": "Optimization",
+            "description": (
+                "Storage/performance/utility tuning. These settings directly trade off file size, memory use, "
+                "decode speed, and visual usefulness."
+            ),
+            "keys": [
+                "OPENRECALL_AV1_CRF",
+                "OPENRECALL_AV1_PRESET",
+                "OPENRECALL_AV1_THREADS",
+                "OPENRECALL_AV1_PLAYBACK_FPS",
+                "OPENRECALL_THUMB_QUALITY",
+                "OPENRECALL_THUMB_MAX_DIMENSION",
+                "OPENRECALL_SIMILARITY_FRAME_WIDTH",
+            ],
+        },
+        {
+            "title": "AV1 Segment Batching",
+            "description": (
+                "Batching now rotates by frame count, not by time. "
+                "This controls how many lossless full-resolution WebPs are staged before AV1 encode."
+            ),
+            "keys": [
+                "OPENRECALL_AV1_SEGMENT_FRAMES",
+                "OPENRECALL_AV1_SVTAV1_PARAMS",
+            ],
+        },
+        {
+            "title": "Capture & Runtime",
+            "description": "Core runtime behavior and diagnostics.",
+            "keys": [
+                "OPENRECALL_CAPTURE_INTERVAL_SECONDS",
+                "OPENRECALL_VERBOSE_CAPTURE_LOGS",
+                "OPENRECALL_STORAGE_BACKEND",
+                "OPENRECALL_FFMPEG_BIN",
+            ],
+        },
+        {
+            "title": "Privacy Filters",
+            "description": "Sensitive-window and OCR-term exclusion rules.",
+            "keys": [
+                "OPENRECALL_BLACKLIST_WINDOWS",
+                "OPENRECALL_BLACKLIST_WORDS",
+            ],
+        },
+        {
+            "title": "Hotkeys",
+            "description": "Global pause/resume shortcuts.",
+            "keys": [
+                "OPENRECALL_HOTKEY_PAUSE_5M",
+                "OPENRECALL_HOTKEY_PAUSE_30M",
+                "OPENRECALL_HOTKEY_PAUSE_FOREVER",
+                "OPENRECALL_HOTKEY_RESUME",
+            ],
+        },
+    ]
+
+    section_keys = {
+        key
+        for section in config_sections
+        for key in section["keys"]
+    }
+    ungrouped_keys = [
+        key
+        for key in RUNTIME_CONFIG_KEYS
+        if key not in section_keys
+    ]
+    if ungrouped_keys:
+        config_sections.append(
+            {
+                "title": "Other",
+                "description": "Remaining runtime values.",
+                "keys": ungrouped_keys,
+            }
+        )
+
+    pending_frame_files = glob.glob(os.path.join(pending_frames_path, "*.webp"))
+    pending_frame_files.extend(glob.glob(os.path.join(pending_frames_path, "*.png")))
+    pending_frame_count = len(pending_frame_files)
+
+    capture_interval_seconds = float(
+        effective_values.get("OPENRECALL_CAPTURE_INTERVAL_SECONDS", 1.0)
+    )
+    segment_frame_count = int(effective_values.get("OPENRECALL_AV1_SEGMENT_FRAMES", 1))
+    estimated_segment_window_seconds = max(
+        1,
+        int(round(capture_interval_seconds * segment_frame_count)),
+    )
+
     return render_template_string(
         """
 {% extends "base_template" %}
@@ -2588,8 +3028,8 @@ def config_page():
   <p class="text-muted small">
     Most settings are loaded at startup. Save here, then restart OpenRecall.
   </p>
-  <p class="text-muted small">
-    Live apply is intentionally minimal right now; treat this page as startup configuration.
+  <p class="text-muted small mb-3">
+    AV1 batching is frame-count based. Segment duration-in-seconds config is deprecated for this pipeline.
   </p>
 
   <div class="card mb-3">
@@ -2597,6 +3037,15 @@ def config_page():
       <div class="small text-muted mb-1">Startup-only CLI settings (not persisted here):</div>
       <div class="small"><strong>storage_path:</strong> {{ cli_values.storage_path }}</div>
       <div class="small"><strong>primary_monitor_only:</strong> {{ cli_values.primary_monitor_only }}</div>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-body py-2">
+      <div class="small text-muted mb-1">Pending full-resolution buffer transparency:</div>
+      <div class="small">Lossless pending WebPs currently on disk: <strong>{{ pending_frame_count }}</strong></div>
+      <div class="small">Estimated batch window before AV1 flush: <strong>~{{ estimated_segment_window_seconds }}s</strong> (capture interval × frame count)</div>
+      <div class="small text-muted">Estimate is approximate because unchanged frames are skipped and monitor activity varies.</div>
     </div>
   </div>
 
@@ -2608,17 +3057,27 @@ def config_page():
   {% endif %}
 
   <form method="post" action="/config">
-    <div class="card">
-      <div class="card-body">
+    {% for section in config_sections %}
+    <div class="card mb-3">
+      <div class="card-header py-2">
+        <strong>{{ section["title"] }}</strong>
+        <div class="small text-muted">{{ section["description"] }}</div>
+      </div>
+      <div class="card-body pb-1">
         <div class="form-row">
-          {% for key, value in effective_values.items() %}
+          {% for key in section["keys"] %}
           <div class="form-group col-md-6">
-            <label for="cfg-{{ key }}" class="small font-weight-bold mb-1">{{ key }}</label>
-            <input id="cfg-{{ key }}" name="{{ key }}" class="form-control form-control-sm" value="{{ value }}">
+            <label for="cfg-{{ key }}" class="small font-weight-bold mb-1">{{ field_meta.get(key, {}).get('label', key) }}</label>
+            <input id="cfg-{{ key }}" name="{{ key }}" class="form-control form-control-sm" value="{{ formatted_values.get(key, '') }}">
+            <small class="form-text text-muted">{{ field_meta.get(key, {}).get('hint', '') }}</small>
           </div>
           {% endfor %}
         </div>
       </div>
+    </div>
+    {% endfor %}
+
+    <div class="card">
       <div class="card-footer d-flex justify-content-between align-items-center">
         <small class="text-muted">Changes are persisted to JSON config and applied on next startup.</small>
         <button type="submit" class="btn btn-sm btn-primary">Save</button>
@@ -2629,7 +3088,11 @@ def config_page():
 {% endblock %}
 """,
         config_file_path=config_file_path,
-        effective_values=effective_values,
+        formatted_values=formatted_values,
+        field_meta=field_meta,
+        config_sections=config_sections,
+        pending_frame_count=pending_frame_count,
+        estimated_segment_window_seconds=estimated_segment_window_seconds,
         cli_values={
           "storage_path": args.storage_path or "(default appdata path)",
           "primary_monitor_only": bool(args.primary_monitor_only),
@@ -2753,6 +3216,7 @@ if __name__ == "__main__":
 
     create_db()
     _recover_recent_corrupt_segments()
+    _recover_pending_webp_segments()
 
     print(f"Appdata folder: {appdata_folder}")
 
@@ -2760,6 +3224,10 @@ if __name__ == "__main__":
     hotkey_listener = start_hotkey_listener()
     if hotkey_listener is None:
       print("Global hotkeys unavailable (install/check pynput and desktop session).")
+
+    tray_thread = start_linux_tray()
+    if tray_thread is None:
+      print("Tray icon unavailable (install/check python3-gi and AppIndicator support).")
 
     # Start the thread to record screenshots
     t = Thread(target=record_screenshots_thread)

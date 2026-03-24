@@ -22,6 +22,7 @@ with patch("openrecall.config.db_path", mock_db_path):
         delete_entries_by_segment_filenames,
         get_all_entries,
         get_media_entries_for_segments,
+        get_pending_segment_recovery_entries,
         get_segment_frame_index,
         get_timeline_entries,
         get_timestamps,
@@ -341,6 +342,50 @@ class TestDatabase(unittest.TestCase):
         entries = get_all_entries()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].segment_filename, "seg_keep.mkv")
+
+    def test_get_pending_segment_recovery_entries(self):
+        embedding = np.array([0.3, 0.4], dtype=np.float32)
+        ts = int(time.time())
+
+        insert_entry(
+            "A",
+            ts,
+            embedding,
+            "App",
+            "Title",
+            monitor_id=1,
+            segment_filename="seg_recover_1.mkv",
+            segment_pts_ms=1000,
+            thumb_filename="recover_a.webp",
+        )
+        insert_entry(
+            "B",
+            ts + 1,
+            embedding,
+            "App",
+            "Title",
+            monitor_id=1,
+            segment_filename="seg_recover_1.mkv",
+            segment_pts_ms=0,
+            thumb_filename="recover_b.webp",
+        )
+        insert_entry(
+            "C",
+            ts + 2,
+            embedding,
+            "App",
+            "Title",
+            monitor_id=2,
+            segment_filename="seg_other.mkv",
+            segment_pts_ms=0,
+            thumb_filename="other.webp",
+        )
+
+        rows = get_pending_segment_recovery_entries(["recover_a.webp", "recover_b.webp"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].segment_filename, "seg_recover_1.mkv")
+        self.assertEqual(rows[0].thumb_filename, "recover_b.webp")
+        self.assertEqual(rows[1].thumb_filename, "recover_a.webp")
 
 
 class TestFfmpegHooks(unittest.TestCase):

@@ -21,6 +21,16 @@ Entry = namedtuple(
         "embedding",
     ],
 )
+PendingSegmentRecoveryEntry = namedtuple(
+    "PendingSegmentRecoveryEntry",
+    [
+        "segment_filename",
+        "monitor_id",
+        "segment_pts_ms",
+        "thumb_filename",
+        "id",
+    ],
+)
 TimelineEntry = namedtuple(
     "TimelineEntry",
     [
@@ -322,6 +332,46 @@ def get_media_entries_for_segments(segment_filenames: List[str]) -> List[Tuple[s
         print(f"Database error while fetching media entries for segments: {e}")
 
     return media_entries
+
+
+def get_pending_segment_recovery_entries(
+    pending_thumb_filenames: List[str],
+) -> List[PendingSegmentRecoveryEntry]:
+    """Returns DB rows for pending thumbs, ordered for segment reconstruction."""
+    if not pending_thumb_filenames:
+        return []
+
+    recovery_entries: List[PendingSegmentRecoveryEntry] = []
+    unique_thumbs = sorted(set(pending_thumb_filenames))
+    placeholders = ",".join("?" for _ in unique_thumbs)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT segment_filename, monitor_id, segment_pts_ms, thumb_filename, id
+                FROM entries
+                WHERE thumb_filename IN ({placeholders})
+                ORDER BY segment_filename ASC, segment_pts_ms ASC, id ASC
+                """,
+                unique_thumbs,
+            )
+            recovery_entries = [
+                PendingSegmentRecoveryEntry(
+                    segment_filename=row["segment_filename"],
+                    monitor_id=row["monitor_id"],
+                    segment_pts_ms=row["segment_pts_ms"],
+                    thumb_filename=row["thumb_filename"],
+                    id=row["id"],
+                )
+                for row in cursor.fetchall()
+            ]
+    except sqlite3.Error as e:
+        print(f"Database error while fetching pending segment recovery rows: {e}")
+
+    return recovery_entries
 
 
 def delete_entries_by_segment_filenames(segment_filenames: List[str]) -> int:

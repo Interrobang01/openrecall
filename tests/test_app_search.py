@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from collections import namedtuple
 
 from openrecall.app import (
     _apply_proximity_dedup,
@@ -15,8 +16,10 @@ from openrecall.app import (
     _proximity_level_to_seconds,
     _proximity_seconds_to_level,
     _parse_search_query,
+    _recover_pending_webp_segments,
     _resolve_search_metric,
     app,
+    startup_recovery_state,
 )
 import openrecall.screenshot as screenshot
 
@@ -248,6 +251,122 @@ class TestOpenMediaFileApi(unittest.TestCase):
 
             self.assertEqual(response.status_code, 404)
             self.assertFalse(response.get_json().get("ok"))
+
+
+class TestConfigPage(unittest.TestCase):
+    def setUp(self):
+        app.testing = True
+        self.client = app.test_client()
+
+    def test_config_page_renders(self):
+        response = self.client.get("/config")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Optimization", response.data)
+        self.assertIn(b"Lossless WebPs Before AV1 Encode", response.data)
+
+
+class _FakeProcessStdin:
+    def __init__(self):
+        self.closed = False
+        self.data = bytearray()
+
+    def write(self, payload: bytes) -> int:
+        self.data.extend(payload)
+        return len(payload)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRecoveryProcess:
+    def __init__(self, command):
+        self.command = command
+        self.stdin = _FakeProcessStdin()
+        self.stderr = None
+        self.returncode = 0
+
+    def communicate(self, timeout: int = 0):
+        output_path = self.command[-1]
+        with open(output_path, "wb") as output_file:
+            output_file.write(b"fake-av1-segment")
+        return b"", b""
+
+
+class TestStartupPendingRecovery(unittest.TestCase):
+    def test_recover_pending_webp_segments_encodes_and_cleans(self):
+        recovery_row = namedtuple(
+            "RecoveryRow",
+            ["segment_filename", "monitor_id", "segment_pts_ms", "thumb_filename", "id"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_pending, tempfile.TemporaryDirectory() as tmp_segments, mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ), mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ), mock.patch(
+            "openrecall.app.OPENRECALL_FFMPEG_BIN",
+            "ffmpeg",
+        ), mock.patch(
+            "openrecall.app.subprocess.Popen",
+            side_effect=lambda *args, **kwargs: _FakeRecoveryProcess(args[0]),
+        ), mock.patch(
+            "openrecall.app.get_pending_segment_recovery_entries",
+            return_value=[
+                recovery_row("1000_m1.mkv", 1, 0, "1000_m1.webp", 1),
+                recovery_row("1000_m1.mkv", 1, 500, "1001_m1.webp", 2),
+            ],
+        ), mock.patch(
+            "openrecall.app.get_media_entries_for_segments",
+            return_value=[
+                ("1000_m1.mkv", "1000_m1.webp"),
+                ("1000_m1.mkv", "1001_m1.webp"),
+            ],
+        ):
+            from PIL import Image
+            import numpy as np
+
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(tmp_pending, "1000_m1.webp"),
+                format="WEBP",
+                lossless=True,
+            )
+            Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(
+                os.path.join(tmp_pending, "1001_m1.webp"),
+                format="WEBP",
+                lossless=True,
+            )
+
+            _recover_pending_webp_segments()
+
+            self.assertTrue(os.path.exists(os.path.join(tmp_segments, "1000_m1.mkv")))
+            self.assertFalse(os.path.exists(os.path.join(tmp_pending, "1000_m1.webp")))
+            self.assertFalse(os.path.exists(os.path.join(tmp_pending, "1001_m1.webp")))
+            self.assertEqual(startup_recovery_state["pending_recovered_segments"], 1)
+            self.assertEqual(startup_recovery_state["pending_recovered_frames"], 2)
+            self.assertEqual(startup_recovery_state["pending_recovery_failed_segments"], [])
+
+    def test_recover_pending_webp_segments_purges_orphan_files(self):
+        with tempfile.TemporaryDirectory() as tmp_pending, tempfile.TemporaryDirectory() as tmp_segments, mock.patch(
+            "openrecall.app.pending_frames_path",
+            tmp_pending,
+        ), mock.patch(
+            "openrecall.app.segments_path",
+            tmp_segments,
+        ), mock.patch(
+            "openrecall.app.get_pending_segment_recovery_entries",
+            return_value=[],
+        ):
+            orphan_path = os.path.join(tmp_pending, "orphan.webp")
+            with open(orphan_path, "wb") as orphan_file:
+                orphan_file.write(b"")
+
+            _recover_pending_webp_segments()
+
+            self.assertFalse(os.path.exists(orphan_path))
+            self.assertEqual(startup_recovery_state["pending_orphan_frames_purged"], 1)
+            self.assertEqual(startup_recovery_state["pending_orphan_frames"], 0)
 
 
 if __name__ == "__main__":
