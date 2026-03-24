@@ -882,7 +882,24 @@ let groupedByTimestamp = [];
 const monitorIds = Array.from(
   new Set(allEntries.map(item => Number(item.monitor_id)))
 ).sort((a, b) => a - b);
-let reverseMonitorOrder = false;
+const monitorOrderStorageKey = 'openrecall.timeline.reverseMonitorOrder';
+
+function loadReverseMonitorOrderPreference() {
+  try {
+    return window.localStorage.getItem(monitorOrderStorageKey) === '1';
+  } catch (_error) {
+    return false;
+  }
+}
+
+function saveReverseMonitorOrderPreference(enabled) {
+  try {
+    window.localStorage.setItem(monitorOrderStorageKey, enabled ? '1' : '0');
+  } catch (_error) {
+  }
+}
+
+let reverseMonitorOrder = loadReverseMonitorOrderPreference();
 
 const monitorColumnClass =
   monitorIds.length <= 1
@@ -931,6 +948,7 @@ const timelineSourceBadge = document.getElementById('timelineSourceBadge');
 const timelineEmbeddingBadge = document.getElementById('timelineEmbeddingBadge');
 const timelineOpenFileBtn = document.getElementById('timelineOpenFileBtn');
 const timelineOpenFileFeedback = document.getElementById('timelineOpenFileFeedback');
+const toggleMonitorOrderButton = document.getElementById('toggleMonitorOrder');
 
 let latestDisplayToken = 0;
 const fullFrameRetryCount = 8;
@@ -1350,11 +1368,18 @@ document.getElementById('resetRange').addEventListener('click', function() {
   applyFilter();
 });
 
-document.getElementById('toggleMonitorOrder').addEventListener('click', function() {
-  reverseMonitorOrder = !reverseMonitorOrder;
-  this.textContent = reverseMonitorOrder ? 'Normal monitor order' : 'Reverse monitor order';
-  updateDisplay();
-});
+if (toggleMonitorOrderButton) {
+  toggleMonitorOrderButton.textContent = reverseMonitorOrder
+    ? 'Normal monitor order'
+    : 'Reverse monitor order';
+
+  toggleMonitorOrderButton.addEventListener('click', function() {
+    reverseMonitorOrder = !reverseMonitorOrder;
+    saveReverseMonitorOrderPreference(reverseMonitorOrder);
+    this.textContent = reverseMonitorOrder ? 'Normal monitor order' : 'Reverse monitor order';
+    updateDisplay();
+  });
+}
 
 applyFilter();
 </script>
