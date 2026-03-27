@@ -81,6 +81,9 @@ capture_state: Dict[str, Any] = {
     "last_blocked_reason": "",
     "last_blocked_terms": [],
     "last_blocked_ts": 0,
+    "last_error": "",
+    "last_error_ts": 0,
+    "error_count": 0,
 }
 
 
@@ -98,6 +101,17 @@ def _set_capture_blocked_status(reason: str, terms: List[str]) -> None:
     capture_state["last_blocked_reason"] = reason
     capture_state["last_blocked_terms"] = sorted(set(terms))
     capture_state["last_blocked_ts"] = now_ts
+
+
+def _record_capture_error(exc: Exception) -> None:
+    """Stores and logs capture-loop errors without terminating the thread."""
+    now_ts = int(time.time())
+    message = f"{exc.__class__.__name__}: {exc}"
+    capture_state["last_error"] = message
+    capture_state["last_error_ts"] = now_ts
+    capture_state["error_count"] = int(capture_state.get("error_count") or 0) + 1
+    _set_capture_status("error")
+    logger.exception("Capture loop error: %s", message)
 
 
 def _parse_blacklist_terms(raw_terms: str) -> List[str]:
@@ -606,243 +620,233 @@ def record_screenshots_thread() -> None:
 
     try:
         while True:
-            if capture_state.get("stop_requested"):
-                break
+            try:
+                if capture_state.get("stop_requested"):
+                    _set_capture_status("stopped")
+                    break
 
-            now_ts = int(time.time())
-            currently_paused = is_capture_paused(now_ts)
-            if was_paused_last_iteration and not currently_paused:
-                _notify_capture_pause("Capture resumed (pause timer ended).")
+                now_ts = int(time.time())
+                currently_paused = is_capture_paused(now_ts)
+                if was_paused_last_iteration and not currently_paused:
+                    _notify_capture_pause("Capture resumed (pause timer ended).")
 
-            if currently_paused:
-                _set_capture_status("paused")
-                for monitor_id, buffer in list(pending_segment_buffers.items()):
-                    try:
-                        _set_capture_status("encoding_pending")
-                        _flush_buffer_for_monitor(monitor_id)
-                    except RuntimeError as exc:
-                        logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)
-                    del pending_segment_buffers[monitor_id]
-                was_paused_last_iteration = True
-                time.sleep(1.0)
-                continue
+                if currently_paused:
+                    _set_capture_status("paused")
+                    for monitor_id in list(pending_segment_buffers.keys()):
+                        try:
+                            _set_capture_status("encoding_pending")
+                            _flush_buffer_for_monitor(monitor_id)
+                        except RuntimeError as exc:
+                            logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", monitor_id, exc)
+                        del pending_segment_buffers[monitor_id]
+                    was_paused_last_iteration = True
+                    time.sleep(1.0)
+                    continue
 
-            was_paused_last_iteration = False
+                was_paused_last_iteration = False
 
-            if WINDOW_BLACKLIST_TERMS:
-                open_window_descriptors = get_open_window_descriptors()
-                open_windows_haystack = "\n".join(open_window_descriptors)
-                matched_window_terms = _find_blacklist_matches(
-                    open_windows_haystack,
-                    WINDOW_BLACKLIST_TERMS,
-                )
-                if matched_window_terms:
-                    _set_capture_blocked_status(
-                        "blocked_window_blacklist",
-                        matched_window_terms,
+                if WINDOW_BLACKLIST_TERMS:
+                    open_window_descriptors = get_open_window_descriptors()
+                    open_windows_haystack = "\n".join(open_window_descriptors)
+                    matched_window_terms = _find_blacklist_matches(
+                        open_windows_haystack,
+                        WINDOW_BLACKLIST_TERMS,
                     )
-                    _capture_print(
-                        "capture_blocked_by_window_blacklist "
-                        f"terms={','.join(sorted(set(matched_window_terms)))}"
-                    )
+                    if matched_window_terms:
+                        _set_capture_blocked_status(
+                            "blocked_window_blacklist",
+                            matched_window_terms,
+                        )
+                        _capture_print(
+                            "capture_blocked_by_window_blacklist "
+                            f"terms={','.join(sorted(set(matched_window_terms)))}"
+                        )
+                        time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
+                        continue
+
+                if not is_user_active():
+                    _set_capture_status("user_inactive")
                     time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
                     continue
 
-            if not is_user_active():
-                _set_capture_status("user_inactive")
-                time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
-                continue
+                _set_capture_status("capturing")
 
-            _set_capture_status("capturing")
+                current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
+                _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
+                current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
 
-            current_screenshots: List[Tuple[int, np.ndarray]] = take_screenshots()
-            _capture_print(f"screenshots_taken monitors={len(current_screenshots)}")
+                removed_monitors = set(pending_segment_buffers.keys()) - current_monitor_ids
+                for removed_monitor_id in removed_monitors:
+                    try:
+                        _set_capture_status("encoding_pending")
+                        _flush_buffer_for_monitor(removed_monitor_id)
+                    except RuntimeError as exc:
+                        logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", removed_monitor_id, exc)
+                    del pending_segment_buffers[removed_monitor_id]
 
-            current_monitor_ids = {monitor_id for monitor_id, _ in current_screenshots}
-
-            removed_monitors = set(pending_segment_buffers.keys()) - current_monitor_ids
-            for removed_monitor_id in removed_monitors:
-                try:
-                    _set_capture_status("encoding_pending")
-                    _flush_buffer_for_monitor(removed_monitor_id)
-                except RuntimeError as exc:
-                    logger.warning("Failed flushing pending AV1 segment for monitor %s: %s", removed_monitor_id, exc)
-                del pending_segment_buffers[removed_monitor_id]
-
-            # Ensure we have a last frame for each current screenshot.
-            # This handles cases where monitor setup might change (though unlikely mid-run)
-            if set(last_similarity_frames.keys()) != current_monitor_ids:
-                # If monitor count changes, reset and continue.
-                _capture_print(
-                    "monitor_layout_changed "
-                    f"previous={len(last_similarity_frames)} current={len(current_screenshots)}"
-                )
-                last_similarity_frames = {
-                    monitor_id: _prepare_similarity_frame(screenshot)
-                    for monitor_id, screenshot in current_screenshots
-                }
-                _set_capture_status("monitor_layout_changed")
-                time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
-                continue
-
-            for monitor_id, current_screenshot in current_screenshots:
-                t_frame_start = time.perf_counter()
-                current_similarity_frame = _prepare_similarity_frame(current_screenshot)
-                last_similarity_frame = last_similarity_frames[monitor_id]
-
-                mssim_val = mean_structured_similarity_index(
-                    current_similarity_frame,
-                    last_similarity_frame,
-                )
-                t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
-                capture_state["last_mssim"] = round(mssim_val, 4)
-                _capture_print(
-                    f"similarity_checked monitor={monitor_id} mssim={mssim_val:.4f} "
-                    f"mssim_ms={t_mssim_ms:.1f}"
-                )
-
-                if mssim_val < 0.9:
-                    last_similarity_frames[monitor_id] = current_similarity_frame
-                    timestamp = int(time.time())
-                    capture_id_ms = int(time.time() * 1000)
-
-                    _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
-                    t_ocr_start = time.perf_counter()
-                    ocr_input = _resize_for_ocr(current_screenshot)
-                    text, ocr_diagnostics = extract_text_and_diagnostics_from_image(ocr_input)
-                    t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
-
-                    active_app_name: str = get_active_app_name() or "Unknown App"
-                    active_window_title: str = get_active_window_title() or "Unknown Title"
-
+                if set(last_similarity_frames.keys()) != current_monitor_ids:
                     _capture_print(
-                        f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
-                        f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
+                        "monitor_layout_changed "
+                        f"previous={len(last_similarity_frames)} current={len(current_screenshots)}"
                     )
-
-                    app_title_matches = _find_blacklist_matches(
-                        f"{active_app_name}\n{active_window_title}",
-                        WINDOW_BLACKLIST_TERMS,
-                    )
-                    if app_title_matches:
-                        _set_capture_blocked_status(
-                            "blocked_active_window_blacklist",
-                            app_title_matches,
-                        )
-                        _capture_print(
-                            "capture_blocked_by_active_window_blacklist "
-                            f"monitor={monitor_id} terms={','.join(sorted(set(app_title_matches)))}"
-                        )
-                        continue
-
-                    ocr_matches = _find_blacklist_matches(text, OCR_BLACKLIST_TERMS)
-                    if ocr_matches:
-                        _set_capture_blocked_status(
-                            "blocked_ocr_blacklist",
-                            ocr_matches,
-                        )
-                        _capture_print(
-                            "capture_blocked_by_ocr_blacklist "
-                            f"monitor={monitor_id} terms={','.join(sorted(set(ocr_matches)))}"
-                        )
-                        continue
-
-                    t_embed_ms = 0.0
-                    t_encode_ms = 0.0
-                    t_db_ms = 0.0
-                    if text.strip():
-                        _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
-                        t_embed_start = time.perf_counter()
-                        embedding: np.ndarray = get_embedding(text)
-                        t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
-                        _capture_print(
-                            f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
-                            f"embedding_ms={t_embed_ms:.1f}"
-                        )
-
-                        _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
-                        t_encode_start = time.perf_counter()
-
-                        thumb_filename = _save_thumbnail(
-                            current_screenshot,
-                            capture_id_ms,
-                            monitor_id,
-                        )
-
-                        pending_buffer = pending_segment_buffers.setdefault(
-                            monitor_id,
-                            MonitorPendingSegmentBuffer(monitor_id),
-                        )
-                        segment_filename, segment_pts_ms, should_flush_segment = pending_buffer.add_frame(
-                            current_screenshot,
-                            capture_id_ms,
-                            thumb_filename,
-                        )
-
-                        if should_flush_segment:
-                            _set_capture_status("encoding_pending")
-                            flushed_segment = pending_buffer.flush_to_segment()
-                            if flushed_segment:
-                                capture_state["last_segment_ts"] = int(time.time())
-
-                        t_encode_ms = (time.perf_counter() - t_encode_start) * 1000
-
-                        t_db_start = time.perf_counter()
-
-                        insert_entry(
-                            text,
-                            timestamp,
-                            embedding,
-                            active_app_name,
-                            active_window_title,
-                            monitor_id=monitor_id,
-                            segment_filename=segment_filename,
-                            segment_pts_ms=segment_pts_ms,
-                            thumb_filename=thumb_filename,
-                        )
-                        t_db_ms = (time.perf_counter() - t_db_start) * 1000
-                        _capture_print(
-                            "db_write_stop "
-                            f"monitor={monitor_id} timestamp={timestamp} "
-                            f"encode_ms={t_encode_ms:.1f} db_ms={t_db_ms:.1f} "
-                            f"segment={segment_filename} pts_ms={segment_pts_ms} "
-                            f"thumb={thumb_filename}"
-                        )
-                    else:
-                        _capture_print(
-                            f"embedding_skipped monitor={monitor_id} timestamp={timestamp} reason=no_text"
-                        )
-
-                    total_ms = (time.perf_counter() - t_frame_start) * 1000
-                    timing = {
-                        "timestamp": timestamp,
-                        "mssim_ms": round(t_mssim_ms, 1),
-                        "ocr_ms": round(t_ocr_ms, 1),
-                        "ocr_primary_ms": ocr_diagnostics.get("primary_ms"),
-                        "embedding_ms": round(t_embed_ms, 1),
-                        "encode_ms": round(t_encode_ms, 1),
-                        "db_ms": round(t_db_ms, 1),
-                        "total_ms": round(total_ms, 1),
-                        "had_text": bool(text.strip()),
+                    last_similarity_frames = {
+                        monitor_id: _prepare_similarity_frame(screenshot)
+                        for monitor_id, screenshot in current_screenshots
                     }
+                    _set_capture_status("monitor_layout_changed")
+                    time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
+                    continue
 
-                    capture_state["recent_timings"].append(timing)
-                    capture_state["last_capture_ts"] = timestamp
-                    capture_state["captures_this_session"] += 1
-                    _set_capture_status("captured")
+                for monitor_id, current_screenshot in current_screenshots:
+                    t_frame_start = time.perf_counter()
+                    current_similarity_frame = _prepare_similarity_frame(current_screenshot)
+                    last_similarity_frame = last_similarity_frames[monitor_id]
+
+                    mssim_val = mean_structured_similarity_index(
+                        current_similarity_frame,
+                        last_similarity_frame,
+                    )
+                    t_mssim_ms = (time.perf_counter() - t_frame_start) * 1000
+                    capture_state["last_mssim"] = round(mssim_val, 4)
                     _capture_print(
-                        "metrics "
-                        f"timestamp={timestamp} monitor={monitor_id} mssim={mssim_val:.4f} "
-                        f"mssim_ms={timing['mssim_ms']:.1f} ocr_ms={timing['ocr_ms']:.1f} "
-                        f"embedding_ms={timing['embedding_ms']:.1f} "
-                        f"encode_ms={timing['encode_ms']:.1f} db_ms={timing['db_ms']:.1f} "
-                        f"total_ms={timing['total_ms']:.1f} had_text={timing['had_text']} "
-                        f"captures_this_session={capture_state['captures_this_session']}"
+                        f"similarity_checked monitor={monitor_id} mssim={mssim_val:.4f} "
+                        f"mssim_ms={t_mssim_ms:.1f}"
                     )
 
-            _reclaim_native_memory()
-            _set_capture_status("running")
-            time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
+                    if mssim_val < 0.9:
+                        last_similarity_frames[monitor_id] = current_similarity_frame
+                        timestamp = int(time.time())
+                        capture_id_ms = int(time.time() * 1000)
+
+                        _capture_print(f"ocr_start monitor={monitor_id} timestamp={timestamp}")
+                        t_ocr_start = time.perf_counter()
+                        ocr_input = _resize_for_ocr(current_screenshot)
+                        text, ocr_diagnostics = extract_text_and_diagnostics_from_image(ocr_input)
+                        t_ocr_ms = (time.perf_counter() - t_ocr_start) * 1000
+
+                        active_app_name: str = get_active_app_name() or "Unknown App"
+                        active_window_title: str = get_active_window_title() or "Unknown Title"
+
+                        _capture_print(
+                            f"ocr_stop monitor={monitor_id} timestamp={timestamp} "
+                            f"ocr_ms={t_ocr_ms:.1f} text_len={len(text.strip())}"
+                        )
+
+                        app_title_matches = _find_blacklist_matches(
+                            f"{active_app_name}\n{active_window_title}",
+                            WINDOW_BLACKLIST_TERMS,
+                        )
+                        if app_title_matches:
+                            _set_capture_blocked_status(
+                                "blocked_active_window_blacklist",
+                                app_title_matches,
+                            )
+                            _capture_print(
+                                "capture_blocked_by_active_window_blacklist "
+                                f"monitor={monitor_id} terms={','.join(sorted(set(app_title_matches)))}"
+                            )
+                            continue
+
+                        ocr_matches = _find_blacklist_matches(text, OCR_BLACKLIST_TERMS)
+                        if ocr_matches:
+                            _set_capture_blocked_status(
+                                "blocked_ocr_blacklist",
+                                ocr_matches,
+                            )
+                            _capture_print(
+                                "capture_blocked_by_ocr_blacklist "
+                                f"monitor={monitor_id} terms={','.join(sorted(set(ocr_matches)))}"
+                            )
+                            continue
+
+                        t_embed_ms = 0.0
+                        t_encode_ms = 0.0
+                        t_db_ms = 0.0
+                        if text.strip():
+                            _capture_print(f"embedding_start monitor={monitor_id} timestamp={timestamp}")
+                            t_embed_start = time.perf_counter()
+                            embedding: np.ndarray = get_embedding(text)
+                            t_embed_ms = (time.perf_counter() - t_embed_start) * 1000
+                            _capture_print(
+                                f"embedding_stop monitor={monitor_id} timestamp={timestamp} "
+                                f"embedding_ms={t_embed_ms:.1f}"
+                            )
+
+                            _capture_print(f"db_write_start monitor={monitor_id} timestamp={timestamp}")
+                            t_encode_start = time.perf_counter()
+
+                            thumb_filename = _save_thumbnail(
+                                current_screenshot,
+                                capture_id_ms,
+                                monitor_id,
+                            )
+
+                            pending_buffer = pending_segment_buffers.setdefault(
+                                monitor_id,
+                                MonitorPendingSegmentBuffer(monitor_id),
+                            )
+                            segment_filename, segment_pts_ms, should_flush_segment = pending_buffer.add_frame(
+                                current_screenshot,
+                                capture_id_ms,
+                                thumb_filename,
+                            )
+
+                            if should_flush_segment:
+                                _set_capture_status("encoding_pending")
+                                flushed_segment = pending_buffer.flush_to_segment()
+                                if flushed_segment:
+                                    capture_state["last_segment_ts"] = int(time.time())
+
+                            t_encode_ms = (time.perf_counter() - t_encode_start) * 1000
+
+                            t_db_start = time.perf_counter()
+                            insert_entry(
+                                text,
+                                timestamp,
+                                embedding,
+                                active_app_name,
+                                active_window_title,
+                                monitor_id=monitor_id,
+                                segment_filename=segment_filename,
+                                segment_pts_ms=segment_pts_ms,
+                                thumb_filename=thumb_filename,
+                            )
+                            t_db_ms = (time.perf_counter() - t_db_start) * 1000
+                            _capture_print(
+                                "db_write_stop "
+                                f"monitor={monitor_id} timestamp={timestamp} "
+                                f"encode_ms={t_encode_ms:.1f} db_ms={t_db_ms:.1f} "
+                                f"segment={segment_filename} pts_ms={segment_pts_ms} "
+                                f"thumb={thumb_filename}"
+                            )
+                        else:
+                            _capture_print(
+                                f"embedding_skipped monitor={monitor_id} timestamp={timestamp} reason=no_text"
+                            )
+
+                        total_ms = (time.perf_counter() - t_frame_start) * 1000
+                        timing = {
+                            "timestamp": timestamp,
+                            "mssim_ms": round(t_mssim_ms, 1),
+                            "ocr_ms": round(t_ocr_ms, 1),
+                            "ocr_primary_ms": ocr_diagnostics.get("primary_ms"),
+                            "embedding_ms": round(t_embed_ms, 1),
+                            "encode_ms": round(t_encode_ms, 1),
+                            "db_ms": round(t_db_ms, 1),
+                            "total_ms": round(total_ms, 1),
+                            "had_text": bool(text.strip()),
+                        }
+                        capture_state["recent_timings"].append(timing)
+                        capture_state["last_capture_ts"] = timestamp
+                        capture_state["captures_this_session"] += 1
+                        _set_capture_status("captured")
+
+                _reclaim_native_memory()
+                _set_capture_status("running")
+                time.sleep(OPENRECALL_CAPTURE_INTERVAL_SECONDS)
+            except Exception as exc:
+                _record_capture_error(exc)
+                time.sleep(1.0)
     finally:
         for monitor_id, pending_buffer in pending_segment_buffers.items():
             try:

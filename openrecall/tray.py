@@ -115,6 +115,13 @@ def _create_indicator_menu(Gtk):
 
     def _quit_app() -> None:
         request_capture_stop()
+
+        def _delayed_exit() -> None:
+            # Mirror the hard-stop endpoint behavior so tray quit cannot hang.
+            time.sleep(0.3)
+            os._exit(0)
+
+        Thread(target=_delayed_exit, daemon=True).start()
         Gtk.main_quit()
 
     menu.append(_create_menu_item(Gtk, "Quit OpenRecall", _quit_app))
