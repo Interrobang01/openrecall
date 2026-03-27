@@ -117,6 +117,15 @@ For a commit-by-commit summary of everything added since this fork (including bo
 - MacOSX/Windows/Linux
 - Git
 
+Linux tray icon support also requires GTK/AppIndicator bindings at the system level:
+
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+```
+
+If OpenRecall runs from a venv, ensure that environment can access those bindings
+(`--system-site-packages`) or install `PyGObject` in the venv.
+
 To install:
 ```
 python3 -m pip install --upgrade --no-cache-dir git+https://github.com/Interrobang01/openrecall.git

@@ -3232,7 +3232,12 @@ if __name__ == "__main__":
 
     tray_thread = start_linux_tray()
     if tray_thread is None:
-      print("Tray icon unavailable (install/check python3-gi and AppIndicator support).")
+      print(
+          "Tray icon unavailable. On Debian/Ubuntu install: "
+          "sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1. "
+          "If running from a venv, either recreate it with --system-site-packages "
+          "or install PyGObject inside the venv."
+      )
 
     # Start the thread to record screenshots
     t = Thread(target=record_screenshots_thread)
