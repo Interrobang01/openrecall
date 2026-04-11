@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from threading import Thread
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +22,7 @@ from openrecall.config import (
   OPENRECALL_AV1_PRESET,
   OPENRECALL_AV1_SVTAV1_PARAMS,
   OPENRECALL_AV1_THREADS,
+  OPENRECALL_CAPTURE_STALL_SECONDS,
     OPENRECALL_FFMPEG_BIN,
     OPENRECALL_STORAGE_BACKEND,
     RUNTIME_CONFIG_KEYS,
@@ -3207,6 +3209,49 @@ setInterval(loadMetrics, 5000);
     )
 
 
+def _start_capture_stall_watchdog() -> Optional[Thread]:
+  """Starts a watchdog that exits the process when capture appears wedged.
+
+  This enables systemd Restart=on-failure to recover from native hangs
+  (for example, a screenshot grab call that never returns).
+  """
+  stall_seconds = int(OPENRECALL_CAPTURE_STALL_SECONDS)
+  if stall_seconds <= 0:
+    print("Capture stall watchdog disabled (OPENRECALL_CAPTURE_STALL_SECONDS <= 0).")
+    return None
+
+  def _watchdog_loop() -> None:
+    while True:
+      if bool(capture_state.get("stop_requested")):
+        return
+
+      now_ts = int(time.time())
+      status = str(capture_state.get("status") or "")
+      status_updated_ts = int(capture_state.get("status_updated_ts") or 0)
+
+      # We only auto-restart on states that should normally be brief.
+      if status in {"capturing", "encoding_pending"} and status_updated_ts > 0:
+        stalled_for = now_ts - status_updated_ts
+        if stalled_for >= stall_seconds:
+          print(
+            "Capture watchdog: detected stalled capture loop "
+            f"(status={status!r}, stalled_for={stalled_for}s, threshold={stall_seconds}s). "
+            "Exiting for systemd restart."
+          )
+          os._exit(1)
+
+      time.sleep(2.0)
+
+  watchdog_thread = Thread(
+    target=_watchdog_loop,
+    daemon=True,
+    name="openrecall-capture-watchdog",
+  )
+  watchdog_thread.start()
+  print(f"Capture stall watchdog started (threshold={stall_seconds}s).")
+  return watchdog_thread
+
+
 if __name__ == "__main__":
     try:
         if OPENRECALL_STORAGE_BACKEND != "av1_hybrid":
@@ -3229,6 +3274,8 @@ if __name__ == "__main__":
     hotkey_listener = start_hotkey_listener()
     if hotkey_listener is None:
       print("Global hotkeys unavailable (install/check pynput and desktop session).")
+
+    _start_capture_stall_watchdog()
 
     tray_thread = start_linux_tray()
     if tray_thread is None:
