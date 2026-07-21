@@ -41,9 +41,6 @@ TimelineEntry = namedtuple(
         "thumb_filename",
         "app",
         "title",
-        "text",
-        "embedding_magnitude",
-        "embedding_is_zero",
     ],
 )
 
@@ -238,20 +235,13 @@ def get_timeline_entries() -> List[TimelineEntry]:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT timestamp, monitor_id, segment_filename, segment_pts_ms, thumb_filename, app, title, text, embedding
+                SELECT timestamp, monitor_id, segment_filename, segment_pts_ms, thumb_filename, app, title
                 FROM entries
                 ORDER BY timestamp DESC, monitor_id ASC
                 """
             )
             results = cursor.fetchall()
             for row in results:
-                embedding_blob = row["embedding"]
-                embedding = (
-                    np.frombuffer(embedding_blob, dtype=np.float32)
-                    if embedding_blob
-                    else np.array([], dtype=np.float32)
-                )
-                embedding_magnitude = float(np.linalg.norm(embedding)) if embedding.size else 0.0
                 timeline_entries.append(
                     TimelineEntry(
                         timestamp=row["timestamp"],
@@ -261,14 +251,28 @@ def get_timeline_entries() -> List[TimelineEntry]:
                         thumb_filename=row["thumb_filename"],
                         app=row["app"],
                         title=row["title"],
-                        text=row["text"],
-                        embedding_magnitude=embedding_magnitude,
-                        embedding_is_zero=embedding_magnitude <= 1e-8,
                     )
                 )
     except sqlite3.Error as e:
         print(f"Database error while fetching timeline entries: {e}")
     return timeline_entries
+
+
+def get_entry_text_by_thumb(thumb_filename: str) -> Optional[str]:
+    """Returns the OCR text for an entry by its thumbnail filename."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT text FROM entries WHERE thumb_filename = ? LIMIT 1",
+                (thumb_filename,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                return row[0] or ""
+    except sqlite3.Error as e:
+        print(f"Database error while fetching entry text: {e}")
+    return None
 
 
 def get_segment_frame_index(segment_filename: str, thumb_filename: str) -> Optional[int]:

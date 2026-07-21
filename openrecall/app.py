@@ -41,9 +41,10 @@ from openrecall.database import (
     create_db,
     delete_entries_by_segment_filenames,
     get_all_entries,
+    get_entry_text_by_thumb,
     get_media_entries_for_segments,
     get_pending_segment_recovery_entries,
-  get_segment_frame_index,
+    get_segment_frame_index,
     get_timestamps,
     get_timeline_entries,
 )
@@ -115,14 +116,6 @@ def _json_safe(value):
   if isinstance(value, np.ndarray):
     return value.tolist()
   return value
-
-
-def _embedding_magnitude(embedding: np.ndarray) -> float:
-  """Returns L2 norm of an embedding, or 0 for empty/invalid vectors."""
-  vector = np.asarray(embedding, dtype=np.float32)
-  if vector.size == 0:
-    return 0.0
-  return float(np.linalg.norm(vector))
 
 
 def _safe_media_name(filename: str, allowed_extensions: Tuple[str, ...]) -> str:
@@ -1379,6 +1372,28 @@ def _proximity_level_to_seconds(level: int, max_seconds: int) -> int:
     return max(PROXIMITY_MIN_SECONDS, min(safe_max, seconds))
 
 
+def _build_page_range(current_page: int, total_pages: int) -> List:
+    """Builds a pagination range with ellipsis for large page counts."""
+    if total_pages <= 7:
+        return list(range(1, total_pages + 1))
+
+    pages: List = []
+    if current_page <= 4:
+        pages = list(range(1, 6)) + ["...", total_pages]
+    elif current_page >= total_pages - 3:
+        pages = [1, "..."] + list(range(total_pages - 4, total_pages + 1))
+    else:
+        pages = [1, "...", current_page - 1, current_page, current_page + 1, "...", total_pages]
+    return pages
+
+
+def _build_search_query_string(args, exclude: List[str]) -> str:
+    """Builds URL query string from request args, excluding specified keys."""
+    from urllib.parse import urlencode
+    params = [(k, v) for k, v in args.items(multi=True) if k not in exclude]
+    return urlencode(params)
+
+
 @app.route("/")
 def timeline():
     timeline_entries = [
@@ -1388,11 +1403,8 @@ def timeline():
             "segment_filename": entry.segment_filename,
             "segment_pts_ms": entry.segment_pts_ms,
             "thumb_filename": entry.thumb_filename,
-      "app": entry.app or "",
-      "title": entry.title or "",
-      "text": entry.text or "",
-            "embedding_magnitude": entry.embedding_magnitude,
-            "embedding_is_zero": entry.embedding_is_zero,
+            "app": entry.app or "",
+            "title": entry.title or "",
         }
         for entry in get_timeline_entries()
     ]
@@ -1460,7 +1472,6 @@ def timeline():
         <div class="modal-footer py-2 d-block">
           <div class="d-flex flex-wrap align-items-center mb-2" style="gap:6px;">
             <span class="badge badge-warning" id="timelineSourceBadge">Thumbnail</span>
-            <span class="badge badge-light border text-muted" id="timelineEmbeddingBadge"></span>
             <button type="button" class="btn btn-sm btn-outline-secondary ml-auto" id="timelineOpenFileBtn">Open frame file</button>
           </div>
           <div class="small text-muted mb-2" id="timelineOpenFileFeedback"></div>
@@ -1543,7 +1554,6 @@ const modalImage = document.getElementById('timelineModalImage');
 const modalMeta = document.getElementById('timelineModalMeta');
 const modalText = document.getElementById('timelineModalText');
 const timelineSourceBadge = document.getElementById('timelineSourceBadge');
-const timelineEmbeddingBadge = document.getElementById('timelineEmbeddingBadge');
 const timelineOpenFileBtn = document.getElementById('timelineOpenFileBtn');
 const timelineOpenFileFeedback = document.getElementById('timelineOpenFileFeedback');
 const toggleMonitorOrderButton = document.getElementById('toggleMonitorOrder');
@@ -1586,12 +1596,15 @@ function setTimelineSourceBadge(source) {
   timelineSourceBadge.textContent = 'Thumbnail';
 }
 
-function formatEmbeddingBadge(item) {
-  const magnitude = Number(item.embedding_magnitude || 0);
-  if (item.embedding_is_zero || magnitude <= 1e-8) {
-    return 'Embedding ‖e‖=0 (zero)';
-  }
-  return 'Embedding ‖e‖=' + magnitude.toFixed(4);
+function fetchEntryText(thumbFilename, onSuccess) {
+  fetch('/api/entry-details?thumb=' + encodeURIComponent(thumbFilename))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.text !== undefined) {
+        onSuccess(data.text || 'No OCR text.');
+      }
+    })
+    .catch(function() {});
 }
 
 function buildFrameAttemptUrl(frameUrl, attempt) {
@@ -1723,10 +1736,10 @@ function openTimelineModal(item, groupTimestamp, isFallback) {
     '<span class="ml-2 text-muted small">' + new Date(displayTimestamp * 1000).toLocaleString() + '</span>' +
     fallbackBadge +
     appTitle;
-  modalText.textContent = item.text || 'No OCR text.';
-  if (timelineEmbeddingBadge) {
-    timelineEmbeddingBadge.textContent = formatEmbeddingBadge(item);
-  }
+  modalText.textContent = 'Loading...';
+  fetchEntryText(item.thumb_filename, function(text) {
+    modalText.textContent = text;
+  });
   setTimelineSourceBadge('thumbnail');
   modalImage.dataset.source = 'thumbnail';
   setTimelineFeedback('', false);
@@ -2068,7 +2081,6 @@ def search():
             reverse=_score_sort_descending(metric),
         )
         for index, score in scored_candidates:
-            embedding_magnitude = _embedding_magnitude(entries[index].embedding)
             results.append(
                 {
                     "timestamp": entries[index].timestamp,
@@ -2078,15 +2090,11 @@ def search():
                     "thumb_filename": entries[index].thumb_filename,
                     "app": entries[index].app or "",
                     "title": entries[index].title or "",
-                    "text": entries[index].text or "",
                     "score": _format_search_score(metric, score, bool(expression_terms)),
-                    "embedding_magnitude": embedding_magnitude,
-                    "embedding_is_zero": embedding_magnitude <= 1e-8,
                 }
             )
     elif exact_phrases:
         for index in candidate_indices:
-            embedding_magnitude = _embedding_magnitude(entries[index].embedding)
             results.append(
                 {
                     "timestamp": entries[index].timestamp,
@@ -2096,10 +2104,7 @@ def search():
                     "thumb_filename": entries[index].thumb_filename,
                     "app": entries[index].app or "",
                     "title": entries[index].title or "",
-                    "text": entries[index].text or "",
                     "score": "Exact",
-                    "embedding_magnitude": embedding_magnitude,
-                    "embedding_is_zero": embedding_magnitude <= 1e-8,
                 }
             )
 
@@ -2107,6 +2112,15 @@ def search():
 
     total_before_proximity = len(results)
     results = _apply_proximity_dedup(results, proximity_seconds)
+
+    total_results = len(results)
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(200, max(10, request.args.get("per_page", 50, type=int)))
+    total_pages = max(1, (total_results + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    paginated_results = results[start_idx:end_idx]
 
     return render_template_string(
         """
@@ -2116,7 +2130,28 @@ def search():
   {% if not results %}
     <div class="alert alert-info">No results.</div>
   {% else %}
-  <p class="text-muted small mb-2">{{ results|length }} results (from {{ total_before_proximity }} before proximity dedupe) · {{ metric_label }}</p>
+  <p class="text-muted small mb-2">{{ total_results }} results (from {{ total_before_proximity }} before proximity dedupe) · {{ metric_label }} · Page {{ page }}/{{ total_pages }}</p>
+  {% if total_pages > 1 %}
+  <nav class="mb-3">
+    <ul class="pagination pagination-sm flex-wrap">
+      <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+        <a class="page-link" href="?{{ query_string }}&page={{ page - 1 }}">Prev</a>
+      </li>
+      {% for p in page_range %}
+        {% if p == '...' %}
+          <li class="page-item disabled"><span class="page-link">...</span></li>
+        {% else %}
+          <li class="page-item {% if p == page %}active{% endif %}">
+            <a class="page-link" href="?{{ query_string }}&page={{ p }}">{{ p }}</a>
+          </li>
+        {% endif %}
+      {% endfor %}
+      <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+        <a class="page-link" href="?{{ query_string }}&page={{ page + 1 }}">Next</a>
+      </li>
+    </ul>
+  </nav>
+  {% endif %}
   <div class="row">
     {% for r in results %}
     <div class="col-md-3 mb-4">
@@ -2137,14 +2172,33 @@ def search():
             <i class="bi bi-app-indicator"></i> {{ r.app }}{% if r.title %} — {{ r.title }}{% endif %}
           </div>
           {% endif %}
-          {% if r.text %}
-          <div class="mt-1" style="max-height:6rem; overflow-y:auto; font-size:0.72rem; color:#6c757d; white-space:pre-wrap; border-top:1px solid #eee; padding-top:4px;">{{ r.text }}</div>
-          {% endif %}
         </div>
       </div>
     </div>
     {% endfor %}
   </div>
+
+  {% if total_pages > 1 %}
+  <nav class="mt-3">
+    <ul class="pagination pagination-sm flex-wrap">
+      <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+        <a class="page-link" href="?{{ query_string }}&page={{ page - 1 }}">Prev</a>
+      </li>
+      {% for p in page_range %}
+        {% if p == '...' %}
+          <li class="page-item disabled"><span class="page-link">...</span></li>
+        {% else %}
+          <li class="page-item {% if p == page %}active{% endif %}">
+            <a class="page-link" href="?{{ query_string }}&page={{ p }}">{{ p }}</a>
+          </li>
+        {% endif %}
+      {% endfor %}
+      <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+        <a class="page-link" href="?{{ query_string }}&page={{ page + 1 }}">Next</a>
+      </li>
+    </ul>
+  </nav>
+  {% endif %}
 
   <div class="modal fade" id="searchModal" tabindex="-1" role="dialog" aria-hidden="true">
     <div class="modal-dialog" role="document" style="max-width:min(1200px, 92vw); margin:2vh auto;">
@@ -2168,7 +2222,6 @@ def search():
         <div class="modal-footer py-2 d-block">
           <div class="d-flex flex-wrap align-items-center mb-2" style="gap:6px;">
             <span class="badge badge-warning" id="searchSourceBadge">Thumbnail</span>
-            <span class="badge badge-light border text-muted" id="searchEmbeddingBadge"></span>
             <button type="button" class="btn btn-sm btn-outline-secondary ml-auto" id="searchOpenFileBtn">Open frame file</button>
           </div>
           <div class="small text-muted mb-2" id="searchOpenFileFeedback"></div>
@@ -2191,7 +2244,6 @@ document.addEventListener('DOMContentLoaded', function() {
   const text = document.getElementById('searchModalText');
   const meta = document.getElementById('searchModalMeta');
   const sourceBadge = document.getElementById('searchSourceBadge');
-  const embeddingBadge = document.getElementById('searchEmbeddingBadge');
   const openFileBtn = document.getElementById('searchOpenFileBtn');
   const openFileFeedback = document.getElementById('searchOpenFileFeedback');
   const prevBtn = document.getElementById('searchPrevBtn');
@@ -2225,14 +2277,6 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     sourceBadge.classList.add('badge-warning');
     sourceBadge.textContent = 'Thumbnail';
-  }
-
-  function formatEmbeddingBadge(result) {
-    const magnitude = Number(result.embedding_magnitude || 0);
-    if (result.embedding_is_zero || magnitude <= 1e-8) {
-      return 'Embedding ‖e‖=0 (zero)';
-    }
-    return 'Embedding ‖e‖=' + magnitude.toFixed(4);
   }
 
   function buildTrialUrl(frameUrl, attempt) {
@@ -2344,10 +2388,15 @@ document.addEventListener('DOMContentLoaded', function() {
       '<span class="ml-2 text-muted small">' + new Date(result.timestamp * 1000).toLocaleString() + '</span>' +
       appTitle;
 
-    text.textContent = result.text || 'No OCR text.';
-    if (embeddingBadge) {
-      embeddingBadge.textContent = formatEmbeddingBadge(result);
-    }
+    text.textContent = 'Loading...';
+    fetch('/api/entry-details?thumb=' + encodeURIComponent(result.thumb_filename))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.text !== undefined) {
+          text.textContent = data.text || 'No OCR text.';
+        }
+      })
+      .catch(function() { text.textContent = 'Failed to load text.'; });
     setSourceBadge('thumbnail');
     setOpenFileFeedback('', false);
     updateNavButtons();
@@ -2444,22 +2493,28 @@ document.addEventListener('DOMContentLoaded', function() {
 </script>
 {% endblock %}
 """,
-        results=results,
-  metric_label=SEARCH_METRICS[metric],
-  total_before_proximity=total_before_proximity,
-  search_q=q,
-  search_metric=metric,
-  search_date_from=date_from_raw,
-  search_date_to=date_to_raw,
-  search_window_filter=window_filter,
-  search_monitor_filter=(str(monitor_filter) if monitor_filter is not None else ""),
-  search_monitor_options=monitor_options,
-  search_proximity_seconds=proximity_seconds,
-  search_proximity_level=proximity_level,
-  search_proximity_human=_format_proximity_human(proximity_seconds),
-  search_proximity_max_seconds=proximity_max_seconds,
-  search_proximity_max_human=_format_proximity_human(proximity_max_seconds),
-  search_proximity_slider_steps=PROXIMITY_SLIDER_STEPS,
+        results=paginated_results,
+        total_results=total_results,
+        metric_label=SEARCH_METRICS[metric],
+        total_before_proximity=total_before_proximity,
+        page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        page_range=_build_page_range(page, total_pages),
+        query_string=_build_search_query_string(request.args, exclude=["page"]),
+        search_q=q,
+        search_metric=metric,
+        search_date_from=date_from_raw,
+        search_date_to=date_to_raw,
+        search_window_filter=window_filter,
+        search_monitor_filter=(str(monitor_filter) if monitor_filter is not None else ""),
+        search_monitor_options=monitor_options,
+        search_proximity_seconds=proximity_seconds,
+        search_proximity_level=proximity_level,
+        search_proximity_human=_format_proximity_human(proximity_seconds),
+        search_proximity_max_seconds=proximity_max_seconds,
+        search_proximity_max_human=_format_proximity_human(proximity_max_seconds),
+        search_proximity_slider_steps=PROXIMITY_SLIDER_STEPS,
     )
 
 
@@ -2625,6 +2680,24 @@ def serve_frame():
     response = send_from_directory(frame_cache_path, frame_cache_filename)
     response.headers["X-OpenRecall-Frame-Source"] = "video_frame"
     return response
+
+
+@app.route("/api/entry-details")
+def api_entry_details():
+    """Returns entry details (text) by thumbnail filename."""
+    thumb = (request.args.get("thumb") or "").strip()
+    if not thumb:
+        return jsonify({"error": "Missing thumb parameter"}), 400
+
+    safe_thumb = os.path.basename(thumb)
+    if safe_thumb != thumb:
+        return jsonify({"error": "Invalid thumb parameter"}), 400
+
+    text = get_entry_text_by_thumb(safe_thumb)
+    if text is None:
+        return jsonify({"error": "Entry not found"}), 404
+
+    return jsonify({"text": text})
 
 
 @app.route("/api/stats")
